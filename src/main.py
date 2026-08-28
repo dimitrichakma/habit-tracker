@@ -1,5 +1,6 @@
 """FastAPI service exposing the habit coaching agent over HTTP."""
 
+import logging
 from contextlib import asynccontextmanager
 from datetime import date, timedelta
 
@@ -28,17 +29,28 @@ from .database import (
     is_satisfied,
     satisfaction_window_days,
 )
+from .scheduler import start_reminder_scheduler
+
+# The scheduler's Telegram calls go through python-telegram-bot, which logs
+# every request through httpx at INFO with the bot token in the URL — keep
+# httpx at WARNING so the token never lands in the server logs.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Runs once at server startup/shutdown (not per-request). Prepares the
-    database and builds one shared agent instance that every request reuses
-    for the life of the process — see build_agent()'s docstring for why."""
+    database, starts the daily Telegram reminder scheduler (Phase 2), and
+    builds one shared agent instance that every request reuses for the life
+    of the process — see build_agent()'s docstring for why."""
     init_db()
-    async with build_agent() as agent:
-        app.state.agent = agent
-        yield
+    scheduler = start_reminder_scheduler()
+    try:
+        async with build_agent() as agent:
+            app.state.agent = agent
+            yield
+    finally:
+        scheduler.shutdown(wait=False)
 
 
 app = FastAPI(title="Habit Tracker", lifespan=lifespan)
