@@ -23,6 +23,28 @@ uv_path() {
     command -v uv || { echo "uv not found on PATH" >&2; exit 1; }
 }
 
+# launchd won't accept a fresh `bootstrap` until the previous instance of the
+# label is fully torn down — an immediate re-bootstrap fails with
+# "Bootstrap failed: 5: Input/output error". Wait for the label to disappear,
+# then bootstrap with a short retry.
+wait_gone() {
+    local label="$1"
+    for _ in $(seq 1 20); do
+        launchctl print "$DOMAIN/$label" >/dev/null 2>&1 || return 0
+        sleep 1
+    done
+}
+
+bootstrap_retry() {
+    local label="$1" dest="$2"
+    for _ in $(seq 1 10); do
+        if launchctl bootstrap "$DOMAIN" "$dest" 2>/dev/null; then return 0; fi
+        sleep 1
+    done
+    echo "bootstrap failed for $label" >&2
+    return 1
+}
+
 cmd_install() {
     local uv; uv="$(uv_path)"
     mkdir -p "$LAUNCH_AGENTS" "$PROJECT_DIR/logs"
@@ -31,7 +53,8 @@ cmd_install() {
         sed -e "s|@@UV@@|$uv|g" -e "s|@@PROJECT_DIR@@|$PROJECT_DIR|g" \
             "$SCRIPT_DIR/$label.plist" > "$dest"
         launchctl bootout "$DOMAIN/$label" 2>/dev/null || true
-        launchctl bootstrap "$DOMAIN" "$dest"
+        wait_gone "$label"
+        bootstrap_retry "$label" "$dest"
         echo "installed $label"
     done
     echo "Done. Backend on http://127.0.0.1:8000 ; bot polling Telegram."

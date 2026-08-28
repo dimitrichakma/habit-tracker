@@ -30,6 +30,9 @@
     <dict>
         <key>PATH</key>
         <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <!-- flush logs immediately instead of block-buffering to the file -->
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
     </dict>
 
     <key>RunAtLoad</key>
