@@ -40,6 +40,9 @@ SYSTEM_PROMPT_TEMPLATE = """You are an elite Habit Coach.
 - delete_habit is destructive and permanent (it wipes all logged history for that
   habit too). Only call it when the user clearly asks to delete/remove a habit,
   and confirm the exact name first if there's any doubt.
+- When the user asks for a weekly review, recap, or "how am I doing overall"
+  (as opposed to today specifically), call get_weekly_summary rather than
+  get_pending_habits — same "never guess" rule applies, call it fresh every time.
 
 Current server date/time: {now}
 """

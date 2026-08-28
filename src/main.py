@@ -1,7 +1,7 @@
 """FastAPI service exposing the habit coaching agent over HTTP."""
 
 from contextlib import asynccontextmanager
-from datetime import date
+from datetime import date, timedelta
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException
@@ -18,7 +18,16 @@ from .auth import (
     password_requirement_status,
     verify_password,
 )
-from .database import Habit, User, backfill_orphaned_habits, get_session, init_db, is_due_today, is_satisfied
+from .database import (
+    Habit,
+    User,
+    backfill_orphaned_habits,
+    get_session,
+    init_db,
+    is_due_today,
+    is_satisfied,
+    satisfaction_window_days,
+)
 
 
 @asynccontextmanager
@@ -140,6 +149,105 @@ async def habits_today(user_id: int = Depends(get_current_user_id)) -> TodayDash
             )
             (done if is_satisfied(habit, today) else pending).append(item)
         return TodayDashboard(date=today.isoformat(), done=done, pending=pending)
+    finally:
+        session.close()
+
+
+class DayCompletion(BaseModel):
+    date: str
+    completed: int
+    due: int
+
+
+class HabitDayLog(BaseModel):
+    date: str
+    status: str
+
+
+class HabitHistory(BaseModel):
+    name: str
+    frequency: str
+    logs: list[HabitDayLog]
+
+
+class HabitStats(BaseModel):
+    trend: list[DayCompletion]
+    habits: list[HabitHistory]
+    current_streak: int
+    this_week_rate: float
+    last_week_rate: float
+
+
+@app.get("/habits/stats", response_model=HabitStats)
+async def habits_stats(days: int = 30, user_id: int = Depends(get_current_user_id)) -> HabitStats:
+    """Historical data behind the frontend's Progress charts: a daily
+    completion trend, each habit's raw log history in the window, the
+    current streak, and a week-over-week comparison.
+
+    The trend line only counts daily-style habits (satisfaction_window_days
+    == 1) in its due/completed tally, deliberately excluding "weekly"
+    habits — a weekly habit is only truly due once every 7 days, so folding
+    it into a day-by-day rate would make it look "missed" on the 6 days it
+    was never actually due, distorting the trend. Weekly habits still show
+    up in the per-habit heatmap, just via their real logged days rather
+    than a forced daily due/not-due grid.
+    """
+    days = max(1, min(days, 365))
+    today = date.today()
+    window = [today - timedelta(days=offset) for offset in range(days - 1, -1, -1)]  # oldest -> newest
+
+    session = get_session()
+    try:
+        habits = session.query(Habit).filter(Habit.user_id == user_id).all()
+
+        trend = []
+        for day in window:
+            due_habits = [
+                habit for habit in habits
+                if satisfaction_window_days(habit.frequency) == 1 and is_due_today(habit, day)
+            ]
+            completed = sum(
+                1 for habit in due_habits
+                if any(log.date == day and log.status == "done" for log in habit.logs)
+            )
+            trend.append(DayCompletion(date=day.isoformat(), completed=completed, due=len(due_habits)))
+
+        habit_histories = [
+            HabitHistory(
+                name=habit.name,
+                frequency=habit.frequency,
+                logs=[
+                    HabitDayLog(date=log.date.isoformat(), status=log.status)
+                    for log in habit.logs
+                    if log.date >= window[0]
+                ],
+            )
+            for habit in habits
+        ]
+
+        # Consecutive days (ending today, walking backward) with every due
+        # daily-style habit completed. A day with nothing due doesn't break
+        # the streak — there was nothing to miss.
+        current_streak = 0
+        for day_stat in reversed(trend):
+            if day_stat.due == 0:
+                continue
+            if day_stat.completed < day_stat.due:
+                break
+            current_streak += 1
+
+        def _week_rate(days_slice: list[DayCompletion]) -> float:
+            total_due = sum(entry.due for entry in days_slice)
+            total_done = sum(entry.completed for entry in days_slice)
+            return (total_done / total_due) if total_due else 0.0
+
+        return HabitStats(
+            trend=trend,
+            habits=habit_histories,
+            current_streak=current_streak,
+            this_week_rate=_week_rate(trend[-7:]),
+            last_week_rate=_week_rate(trend[-14:-7]),
+        )
     finally:
         session.close()
 

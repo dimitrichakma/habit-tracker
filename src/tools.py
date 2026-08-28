@@ -9,7 +9,7 @@ from datetime import date, timedelta
 from langchain.tools import ToolRuntime
 from langchain_core.tools import tool
 
-from .database import Habit, HabitLog, get_session, is_due_today, is_satisfied
+from .database import Habit, HabitLog, get_session, is_due_today, is_satisfied, satisfaction_window_days
 
 
 def _current_user_id(runtime: ToolRuntime) -> int:
@@ -171,6 +171,46 @@ def list_habits(*, runtime: ToolRuntime) -> str:
 
 
 @tool
+def get_weekly_summary(*, runtime: ToolRuntime) -> str:
+    """Summarize the last 7 days (including today), per habit. Use this
+    when the user asks for a weekly review, e.g. "how was my week?",
+    "give me a summary", "how am I doing overall".
+
+    Daily-style habits are reported as "N/M days done", where M only counts
+    days the habit was actually due (an "except Friday" habit isn't
+    penalized for the Friday it was never supposed to happen). Weekly
+    habits are reported as satisfied or not for the week as a whole,
+    since "days done" doesn't make sense for something only due once a week.
+    """
+    user_id = _current_user_id(runtime)
+    session = get_session()
+    try:
+        habits = session.query(Habit).filter(Habit.user_id == user_id).all()
+        if not habits:
+            return "No habits have been created yet."
+
+        today = date.today()
+        window = [today - timedelta(days=offset) for offset in range(6, -1, -1)]  # oldest -> newest
+
+        lines = []
+        for habit in habits:
+            if satisfaction_window_days(habit.frequency) >= 7:
+                status = "done" if is_satisfied(habit, today) else "not done"
+                lines.append(f"- {habit.name}: {status} this week (weekly habit)")
+                continue
+
+            due_days = [day for day in window if is_due_today(habit, day)]
+            done_count = sum(
+                1 for log in habit.logs if log.status == "done" and log.date in due_days
+            )
+            lines.append(f"- {habit.name}: {done_count}/{len(due_days)} days done")
+
+        return "Weekly summary (last 7 days):\n" + "\n".join(lines)
+    finally:
+        session.close()
+
+
+@tool
 def delete_habit(habit_name: str, *, runtime: ToolRuntime) -> str:
     """Permanently delete a habit and all of its logged history.
 
@@ -193,4 +233,4 @@ def delete_habit(habit_name: str, *, runtime: ToolRuntime) -> str:
         session.close()
 
 
-TOOLS = [create_new_habit, get_pending_habits, log_habit, list_habits, delete_habit]
+TOOLS = [create_new_habit, get_pending_habits, log_habit, list_habits, get_weekly_summary, delete_habit]

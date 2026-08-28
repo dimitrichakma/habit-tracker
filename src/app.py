@@ -2,8 +2,21 @@
 
 import re
 
+import plotly.graph_objects as go
 import requests
 import streamlit as st
+
+# Palette roles (validated pairing, see the dataviz skill): single-series
+# trend uses categorical slot 1 (blue); the heatmap uses the fixed
+# good/critical status pair plus a neutral gray for "no data" — a status
+# color never carries meaning alone, so it's always paired with the legend
+# caption drawn under the chart, not color alone.
+COLOR_TREND = "#2a78d6"
+COLOR_DONE = "#0ca30c"
+COLOR_MISSED = "#d03b3b"
+COLOR_NEUTRAL = "#e1e0d9"
+COLOR_GRIDLINE = "#e1e0d9"
+COLOR_MUTED_TEXT = "#898781"
 
 # Mirrored (duplicated, not imported) from src/auth.py's PASSWORD_REQUIREMENTS
 # for live client-side feedback — app.py must stay HTTP-only with no backend
@@ -22,6 +35,7 @@ LOGIN_URL = f"{BACKEND_BASE_URL}/auth/login"
 CHAT_URL = f"{BACKEND_BASE_URL}/chat"
 TODAY_URL = f"{BACKEND_BASE_URL}/habits/today"
 HISTORY_URL = f"{BACKEND_BASE_URL}/chat/history"
+STATS_URL = f"{BACKEND_BASE_URL}/habits/stats"
 
 st.set_page_config(page_title="Habit Tracker", page_icon="🏃")
 st.title("Habit Tracker")
@@ -49,6 +63,136 @@ def authed_request(method: str, url: str, **kwargs):
         st.rerun()
     response.raise_for_status()
     return response
+
+
+def render_progress_tab() -> None:
+    """The "consistency over time" charts, backed by GET /habits/stats: a
+    daily completion trend (line/area — the job is "trend over time") and
+    a per-habit heatmap (the job is "compare across a grid"). The day-range
+    radio is the interactive filter the charts respond to."""
+    range_label = st.radio(
+        "Time range", ["Last 7 days", "Last 30 days", "Last 90 days"], index=1, horizontal=True
+    )
+    days = {"Last 7 days": 7, "Last 30 days": 30, "Last 90 days": 90}[range_label]
+
+    try:
+        stats = authed_request("GET", STATS_URL, params={"days": days}, timeout=10).json()
+    except requests.RequestException as exc:
+        st.error(f"Could not load progress data: {exc}")
+        return
+
+    trend = stats["trend"]
+    habits = stats["habits"]
+
+    if not any(entry["due"] > 0 for entry in trend):
+        st.info("Add a daily habit and log a few days to see your consistency trend here.")
+    else:
+        this_week_pct = stats["this_week_rate"] * 100
+        last_week_pct = stats["last_week_rate"] * 100
+
+        col1, col2 = st.columns(2)
+        col1.metric("Current streak", f"{stats['current_streak']} days")
+        col2.metric(
+            "This week's completion",
+            f"{this_week_pct:.0f}%",
+            delta=f"{this_week_pct - last_week_pct:+.0f}pp vs last week",
+        )
+
+        dates = [entry["date"] for entry in trend]
+        # None (not 0%) on a day nothing was due, so the line gaps instead
+        # of misleadingly dropping to the floor.
+        rates = [(entry["completed"] / entry["due"] * 100) if entry["due"] > 0 else None for entry in trend]
+
+        trend_fig = go.Figure(
+            go.Scatter(
+                x=dates,
+                y=rates,
+                mode="lines+markers",
+                line=dict(color=COLOR_TREND, width=2),
+                marker=dict(size=6),
+                fill="tozeroy",
+                fillcolor="rgba(42, 120, 214, 0.12)",
+                connectgaps=False,
+                hovertemplate="%{x}<br>%{y:.0f}% completed<extra></extra>",
+            )
+        )
+        trend_fig.update_layout(
+            title="Daily habit completion rate",
+            yaxis=dict(title="% completed", range=[0, 100], gridcolor=COLOR_GRIDLINE, ticksuffix="%"),
+            xaxis=dict(title=None, gridcolor=COLOR_GRIDLINE),
+            plot_bgcolor="#fcfcfb",
+            paper_bgcolor="rgba(0,0,0,0)",
+            font=dict(color=COLOR_MUTED_TEXT),
+            hovermode="x unified",
+            margin=dict(l=10, r=10, t=40, b=10),
+            height=320,
+            showlegend=False,
+        )
+        st.plotly_chart(trend_fig, use_container_width=True)
+        st.caption("Only counts daily-style habits — weekly habits show in the grid below instead.")
+
+    if not habits:
+        st.info("No habits yet — add one in the Chat tab to start tracking consistency.")
+        return
+
+    st.subheader("Per-habit consistency")
+    all_dates = [entry["date"] for entry in trend]
+    z_grid, hover_grid = [], []
+    for habit in habits:
+        logs_by_date = {log["date"]: log["status"] for log in habit["logs"]}
+        z_row, hover_row = [], []
+        for day in all_dates:
+            status = logs_by_date.get(day)
+            if status == "done":
+                z_row.append(2.5)
+                hover_row.append(f"{habit['name']}<br>{day}: done")
+            elif status is not None:
+                z_row.append(1.5)
+                hover_row.append(f"{habit['name']}<br>{day}: {status}")
+            else:
+                z_row.append(0.5)
+                hover_row.append(f"{habit['name']}<br>{day}: no log")
+        z_grid.append(z_row)
+        hover_grid.append(hover_row)
+
+    # A discrete 3-band colorscale (not a continuous gradient) — each status
+    # is a flat color, not a magnitude, so no colorbar is shown; the legend
+    # caption below pairs color with label instead (color never carries
+    # meaning alone). z values are the band midpoints (0.5/1.5/2.5) over a
+    # 0-3 range, so each falls solidly inside its own band regardless of
+    # any rounding at the exact band edges.
+    band_colors = [COLOR_NEUTRAL, COLOR_MISSED, COLOR_DONE]
+    colorscale = []
+    for i, color in enumerate(band_colors):
+        colorscale.append([i / 3, color])
+        colorscale.append([(i + 1) / 3, color])
+
+    heatmap_fig = go.Figure(
+        go.Heatmap(
+            z=z_grid,
+            x=all_dates,
+            y=[habit["name"] for habit in habits],
+            text=hover_grid,
+            hoverinfo="text",
+            colorscale=colorscale,
+            zmin=0,
+            zmax=3,
+            showscale=False,
+            xgap=2,
+            ygap=2,
+        )
+    )
+    heatmap_fig.update_layout(
+        xaxis=dict(title=None, showgrid=False),
+        yaxis=dict(title=None, autorange="reversed"),
+        plot_bgcolor="#fcfcfb",
+        paper_bgcolor="rgba(0,0,0,0)",
+        font=dict(color=COLOR_MUTED_TEXT),
+        margin=dict(l=10, r=10, t=10, b=10),
+        height=max(120, 40 * len(habits)),
+    )
+    st.plotly_chart(heatmap_fig, use_container_width=True)
+    st.markdown(":green[● Done]&nbsp;&nbsp;:red[● Missed]&nbsp;&nbsp;:gray[● Not logged / not due]")
 
 
 # --- Login / signup gate -------------------------------------------------
@@ -135,24 +279,30 @@ with st.sidebar:
     except requests.RequestException as exc:
         st.error(f"Could not load dashboard: {exc}")
 
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+chat_tab, progress_tab = st.tabs(["💬 Chat", "📊 Progress"])
 
-if prompt := st.chat_input("Talk to your Habit Coach..."):
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
+with chat_tab:
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
 
-    with st.chat_message("assistant"):
-        try:
-            response = authed_request("POST", CHAT_URL, json={"message": prompt}, timeout=60)
-            reply = response.json()["reply"]
-        except requests.RequestException as exc:
-            reply = f"Could not reach the habit tracker backend: {exc}"
+    if prompt := st.chat_input("Talk to your Habit Coach..."):
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
 
-        st.markdown(reply)
+        with st.chat_message("assistant"):
+            try:
+                response = authed_request("POST", CHAT_URL, json={"message": prompt}, timeout=60)
+                reply = response.json()["reply"]
+            except requests.RequestException as exc:
+                reply = f"Could not reach the habit tracker backend: {exc}"
 
-    st.session_state.messages.append({"role": "assistant", "content": reply})
-    # Re-run so the sidebar dashboard re-fetches with the state this message just changed.
-    st.rerun()
+            st.markdown(reply)
+
+        st.session_state.messages.append({"role": "assistant", "content": reply})
+        # Re-run so the sidebar dashboard re-fetches with the state this message just changed.
+        st.rerun()
+
+with progress_tab:
+    render_progress_tab()

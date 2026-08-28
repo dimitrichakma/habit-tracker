@@ -11,7 +11,7 @@
 - Package manager: uv
 - Dependencies: fastapi, uvicorn, langchain, langchain-anthropic, langgraph,
   langgraph-checkpoint-sqlite, sqlalchemy, pydantic, python-dotenv, requests,
-  bcrypt, pyjwt
+  bcrypt, pyjwt, plotly
   - `langchain` (not just `langchain-anthropic`) is required — `create_agent`
     lives in `langchain.agents`, not in the Anthropic integration package.
   - `requests` is a direct dependency of `app.py`, not just a transitive one
@@ -105,6 +105,16 @@
     `get_pending_habits`). The agent is prompted to check this before calling
     `create_new_habit` when the user's wording might refer to an existing
     habit under different phrasing.
+  - `get_weekly_summary()` — trailing 7 days (including today), per habit.
+    Daily-style habits report `"N/M days done"`, where `M` only counts days
+    the habit was actually `is_due_today` for (an "except Friday" habit
+    isn't penalized for a Friday it was never due) — this is a reporting
+    window, distinct from `is_satisfied`'s rolling-window concept. Weekly
+    habits report satisfied-or-not for the week as a whole instead of a
+    fraction, since "days done" doesn't make sense for something due once a
+    week. The system prompt tells the agent to reach for this (not
+    `get_pending_habits`) when asked for a review/recap rather than today's
+    status specifically.
   - `delete_habit(habit_name)` — exact match only (no fuzzy matching, since
     this is destructive and permanent — it cascades to delete the habit's
     logged history too). The system prompt tells the agent to confirm with
@@ -177,6 +187,17 @@
     - Only `status == "done"` counts as satisfied — `"missed"`/`"skipped"`
       (or no log at all) always land in `pending`, with that status shown
       alongside the habit so it stays visible/actionable.
+  - `GET /habits/stats?days=N` — historical data behind the frontend's
+    Progress charts (`N` clamped to 1-365, default 30). Returns a daily
+    completion `trend`, each habit's raw `logs` in the window, `current_streak`,
+    and `this_week_rate`/`last_week_rate`. **The trend only counts
+    daily-style habits** (`satisfaction_window_days == 1`) in its due/completed
+    tally — a weekly habit is only truly due once every 7 days, so folding
+    it into a day-by-day rate would make it look "missed" on the 6 days it
+    was never due, distorting the trend. Weekly habits still appear in the
+    per-habit heatmap via their real logged days, just not the aggregate line.
+    `current_streak` counts consecutive days (ending today) with every due
+    daily-style habit completed; a day with nothing due doesn't break it.
   - `GET /chat/history` (no path param — dropped deliberately; a
     `{user_id}` path segment anyone could edit was exactly the vulnerability
     being fixed) — auth-required, replays *your* thread's past Human/AI
@@ -211,6 +232,24 @@
     plus a manual Refresh button. After every chat reply the app calls
     `st.rerun()` so the dashboard reflects whatever the message just changed
     (e.g. marking a habit done) without the user having to click Refresh.
+  - Main area is `st.tabs(["💬 Chat", "📊 Progress"])`, directly under the
+    title. `render_progress_tab()` (defined before its call site — Streamlit
+    scripts execute top-to-bottom, so a forward reference here would `NameError`)
+    is the "consistency over time" feature: a day-range radio (7/30/90 days)
+    driving `GET /habits/stats`, a two-tile KPI row (`st.metric`, which
+    natively colors the delta), a Plotly line/area chart for the daily
+    completion trend, and a Plotly heatmap for per-habit day-by-day status.
+    - Colors follow the dataviz skill's method: the single-series trend uses
+      categorical slot 1 (`#2a78d6`); the heatmap uses the fixed
+      good/critical status pair (`#0ca30c`/`#d03b3b`) plus a neutral gray for
+      "no log" — a **discrete** 3-band colorscale (not a continuous
+      gradient), since each cell is a status, not a magnitude. `showscale`
+      is off and a manual `:green[]`/`:red[]`/`:gray[]` legend caption is
+      drawn instead, since a status color never carries meaning alone.
+    - `plotly` (`go.Figure`) was chosen over Streamlit's native
+      `st.line_chart`/`st.bar_chart` specifically because the user asked for
+      *interactive* charts — richer hover control, a true crosshair
+      (`hovermode="x unified"`), and no dual-axis temptation.
 - `run.sh` (project root) — starts backend + frontend together in one
   command; Ctrl+C stops both (uses a port-based cleanup trap, since `uv run`
   spawns nested child processes that a plain PID-kill wouldn't reach).
