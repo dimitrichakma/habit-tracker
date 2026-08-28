@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 import os
 from datetime import date
+from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -28,6 +29,10 @@ logger = logging.getLogger(__name__)
 REMINDER_HOUR = 20
 REMINDER_MINUTE = 0
 JOB_ID = "daily_habit_reminder"
+# Pin the reminder to a fixed zone rather than the server's local time, so it
+# still fires at 20:00 Dhaka after deploying to a UTC cloud host. Override
+# with the REMINDER_TIMEZONE env var if the account ever moves zones.
+REMINDER_TIMEZONE = ZoneInfo(os.environ.get("REMINDER_TIMEZONE", "Asia/Dhaka"))
 
 
 def _resolve_user_id(username: str) -> int:
@@ -99,10 +104,12 @@ def start_reminder_scheduler() -> AsyncIOScheduler:
 
     user_id = _resolve_user_id(username)
 
-    scheduler = AsyncIOScheduler()
+    scheduler = AsyncIOScheduler(timezone=REMINDER_TIMEZONE)
     scheduler.add_job(
         _send_reminder,
-        trigger=CronTrigger(hour=REMINDER_HOUR, minute=REMINDER_MINUTE),
+        trigger=CronTrigger(
+            hour=REMINDER_HOUR, minute=REMINDER_MINUTE, timezone=REMINDER_TIMEZONE
+        ),
         args=(bot_token, chat_id, user_id),
         id=JOB_ID,
         replace_existing=True,
@@ -110,9 +117,10 @@ def start_reminder_scheduler() -> AsyncIOScheduler:
     )
     scheduler.start()
     logger.info(
-        "Reminder scheduler started — daily at %02d:%02d for user_id=%d.",
+        "Reminder scheduler started — daily at %02d:%02d %s for user_id=%d.",
         REMINDER_HOUR,
         REMINDER_MINUTE,
+        REMINDER_TIMEZONE.key,
         user_id,
     )
     return scheduler
