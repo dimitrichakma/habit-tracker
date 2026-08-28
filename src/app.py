@@ -29,12 +29,7 @@ PASSWORD_REQUIREMENTS = [
     ("One special character (e.g. ! @ # $ %)", lambda p: re.search(r"[^A-Za-z0-9]", p) is not None),
 ]
 
-# Public ngrok tunnel to the backend running locally on the developer's
-# machine — required for the Streamlit Cloud deployment to reach it at all
-# ("localhost" from Streamlit Cloud's own servers isn't this machine).
-# TEMPORARY: this URL changes every time the ngrok tunnel restarts (free
-# tier, no reserved domain) — update this line whenever that happens.
-BACKEND_BASE_URL = "https://patience-spiritual-remix.ngrok-free.dev"
+BACKEND_BASE_URL = "http://localhost:8000"
 SIGNUP_URL = f"{BACKEND_BASE_URL}/auth/signup"
 LOGIN_URL = f"{BACKEND_BASE_URL}/auth/login"
 CHAT_URL = f"{BACKEND_BASE_URL}/chat"
