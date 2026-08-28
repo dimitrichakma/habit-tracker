@@ -15,3 +15,6 @@ wheels/
 *.db-journal
 *.db-shm
 *.db-wal
+
+# launchd agent logs
+logs/
