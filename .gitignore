@@ -18,3 +18,6 @@ wheels/
 
 # launchd agent logs
 logs/
+
+# personal, not for the repo — my own code-explanation notes
+docs/code-explanations.md

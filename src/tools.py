@@ -33,6 +33,10 @@ def _resolve_log_date(log_date: str) -> date | None:
         return None
 
 
+_WEEKDAY_LABELS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+_PATTERN_LOOKBACK_DAYS = 42  # six weeks — enough to see a weekday-level pattern
+
+
 def _find_habit(session, habit_name: str, user_id: int) -> Habit | list[Habit] | None:
     """Look up a habit (scoped to user_id) by exact name, falling back to a
     case-insensitive substring match (either direction) if nothing matches
@@ -211,6 +215,112 @@ def get_weekly_summary(*, runtime: ToolRuntime) -> str:
 
 
 @tool
+def get_habit_history_pattern(habit_name: str, *, runtime: ToolRuntime) -> str:
+    """Analyze one habit's recent logged history for a *recurring* failure
+    pattern (e.g. "missed 4 of the last 5 Mondays", "missed 3 due days in a
+    row"). Read-only, over the last six weeks of HabitLog data — no data is
+    guessed.
+
+    Call this the moment the user reports missing a habit, before suggesting
+    anything: a smaller "micro-commitment" version of the habit is only worth
+    proposing when this shows a real repeating pattern, not a single off day.
+
+    Args:
+        habit_name: Name of the habit to analyze (fuzzy-matched like log_habit).
+    """
+    user_id = _current_user_id(runtime)
+    session = get_session()
+    try:
+        habit = _find_habit(session, habit_name, user_id)
+        if habit is None:
+            return f"No habit named '{habit_name}' exists."
+        if isinstance(habit, list):
+            names = ", ".join(f"'{h.name}'" for h in habit)
+            return (
+                f"'{habit_name}' matches more than one habit: {names}. "
+                "Ask the user which one they mean."
+            )
+
+        today = date.today()
+        window_start = today - timedelta(days=_PATTERN_LOOKBACK_DAYS - 1)
+        done_dates = {
+            log.date
+            for log in habit.logs
+            if log.status == "done" and window_start <= log.date <= today
+        }
+
+        # Weekly habits: "days of the week" don't apply — report satisfied-or-not
+        # per trailing week instead, matching get_weekly_summary's treatment.
+        if satisfaction_window_days(habit.frequency) >= 7:
+            satisfied_weeks = sum(
+                1
+                for offset in range(6)
+                if done_dates
+                & {today - timedelta(days=7 * offset + d) for d in range(7)}
+            )
+            if satisfied_weeks >= 5:
+                return (
+                    f"'{habit.name}' (weekly): satisfied in {satisfied_weeks} of the "
+                    "last 6 weeks — no recurring failure pattern."
+                )
+            return (
+                f"'{habit.name}' (weekly): satisfied in only {satisfied_weeks} of the "
+                "last 6 weeks — a recurring pattern of missing it."
+            )
+
+        due_days = [
+            window_start + timedelta(days=i)
+            for i in range(_PATTERN_LOOKBACK_DAYS)
+            if is_due_today(habit, window_start + timedelta(days=i))
+        ]
+        if len(due_days) < 5:
+            return (
+                f"'{habit.name}' has only been due {len(due_days)} time(s) in the last "
+                "six weeks — not enough history to call a pattern yet."
+            )
+
+        total_due = len(due_days)
+        total_done = sum(1 for d in due_days if d in done_dates)
+        overall_pct = round(100 * total_done / total_due)
+
+        # Current run of consecutive missed due days, most recent first.
+        miss_streak = 0
+        for day in reversed(due_days):
+            if day in done_dates:
+                break
+            miss_streak += 1
+
+        # Per-weekday trouble spots: a weekday the habit was due on at least 3
+        # times and missed on more than half of them.
+        weekday_lines = []
+        for weekday_index, weekday_name in enumerate(_WEEKDAY_LABELS):
+            days = [d for d in due_days if d.weekday() == weekday_index]
+            if len(days) < 3:
+                continue
+            missed = sum(1 for d in days if d not in done_dates)
+            if missed > len(days) / 2:
+                weekday_lines.append(f"{weekday_name}s: missed {missed} of the last {len(days)}")
+
+        parts = [
+            f"'{habit.name}' over the last six weeks: done {total_done}/{total_due} "
+            f"due days ({overall_pct}%)."
+        ]
+        if miss_streak >= 2:
+            parts.append(f"Currently missed {miss_streak} due days in a row.")
+        if len(weekday_lines) >= 5:
+            # Nearly every weekday is bad — that's an "almost stopped doing it"
+            # pattern, not a weekday-specific one; don't enumerate all seven.
+            parts.append("Missed on most due days across the whole week, not one particular weekday.")
+        elif weekday_lines:
+            parts.append("Weekday trouble spots — " + "; ".join(weekday_lines) + ".")
+        if not weekday_lines and miss_streak < 2 and overall_pct >= 80:
+            parts.append("No strong recurring failure pattern — looks like a one-off off day.")
+        return " ".join(parts)
+    finally:
+        session.close()
+
+
+@tool
 def delete_habit(habit_name: str, *, runtime: ToolRuntime) -> str:
     """Permanently delete a habit and all of its logged history.
 
@@ -233,4 +343,12 @@ def delete_habit(habit_name: str, *, runtime: ToolRuntime) -> str:
         session.close()
 
 
-TOOLS = [create_new_habit, get_pending_habits, log_habit, list_habits, get_weekly_summary, delete_habit]
+TOOLS = [
+    create_new_habit,
+    get_pending_habits,
+    log_habit,
+    list_habits,
+    get_weekly_summary,
+    get_habit_history_pattern,
+    delete_habit,
+]

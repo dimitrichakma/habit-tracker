@@ -29,7 +29,7 @@ from .database import (
     is_satisfied,
     satisfaction_window_days,
 )
-from .scheduler import start_reminder_scheduler
+from .scheduler import run_friction_nudge, start_reminder_scheduler
 
 # The scheduler's Telegram calls go through python-telegram-bot, which logs
 # every request through httpx at INFO with the bot token in the URL — keep
@@ -44,13 +44,15 @@ async def lifespan(app: FastAPI):
     builds one shared agent instance that every request reuses for the life
     of the process — see build_agent()'s docstring for why."""
     init_db()
-    scheduler = start_reminder_scheduler()
-    try:
-        async with build_agent() as agent:
-            app.state.agent = agent
+    # Build the agent first: the scheduler's 20:00 job (Phase 3) invokes it
+    # to generate the nudge text, so it must exist before the job is added.
+    async with build_agent() as agent:
+        app.state.agent = agent
+        scheduler = start_reminder_scheduler(agent)
+        try:
             yield
-    finally:
-        scheduler.shutdown(wait=False)
+        finally:
+            scheduler.shutdown(wait=False)
 
 
 app = FastAPI(title="Habit Tracker", lifespan=lifespan)
@@ -298,6 +300,25 @@ def _as_text(content: object) -> str:
             block.get("text", "") for block in content if isinstance(block, dict) and block.get("type") == "text"
         )
     return ""
+
+
+@app.post("/evaluate_friction", response_model=ChatResponse)
+async def evaluate_friction(user_id: int = Depends(get_current_user_id)) -> ChatResponse:
+    """Manually run the same evening 'friction check' the 20:00 scheduler job
+    runs automatically (Phase 3): look at what's still pending for THIS user
+    and, if anything is, have the coach produce a pattern-aware nudge — same
+    agent, same per-user thread, same micro-commitment logic (all via
+    src/scheduler.run_friction_nudge, so the pending-habit check isn't
+    written twice).
+
+    Like every other endpoint, identity is the JWT's user_id only, never a
+    request-body field — reintroducing a client-supplied user_id here would
+    be the exact bug real auth already fixed in /chat.
+    """
+    reply = await run_friction_nudge(app.state.agent, user_id)
+    if reply is None:
+        return ChatResponse(reply="Nothing pending right now — you're all caught up for today.")
+    return ChatResponse(reply=reply)
 
 
 class HistoryMessage(BaseModel):
