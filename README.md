@@ -105,6 +105,40 @@ Streamlit frontend  --HTTP-->  FastAPI backend  -->  LangGraph agent  -->  Claud
   survive a future vector-store swap unchanged, and the judge is a stronger
   Claude tier than the agent it grades to reduce self-grading bias.
 
+## Evaluation
+
+`pytest evaluation/` runs 6 golden coaching scenarios through the **real**
+agent and grades each reply with three metrics, all judged by
+`claude-opus-5` (a tier above the `claude-sonnet-5` agent, to reduce
+self-grading bias):
+
+| Metric | Checks | Threshold | Across the 6 scenarios |
+|---|---|---|---|
+| **Contextual Precision** (DeepEval) | the retrieved context was relevant to the question | 0.70 | 1.00 on every case |
+| **Faithfulness** (DeepEval) | the reply sticks to what was actually retrieved — no invented facts | 0.70 | 0.75 – 1.00 (mean 0.92) |
+| **Coaching Empathy** (custom) | acknowledges the setback without shaming **and** offers a concrete next step; any shaming caps the score at 0.2 | 0.70 | 0.60 – 1.00 (mean 0.89) |
+
+The scenarios cover the situations the coach has to get right: a habit
+failing only on late-wake days, weekend structure collapse, one habit
+dragging while the rest hold, a self-critical user who's actually improving,
+an evening habit vs. late nights, and a reflection question about a one-off
+bad week.
+
+The suite has teeth — during Phase 4 it caught the agent leaking an internal
+tool name into a reply (`"let me check list_habits"`) and answering a
+reflection question with hollow reassurance and no next step; two
+system-prompt rules fixed both. It's currently surfacing a second issue: the
+empathy metric is built to grade *acknowledging a setback*, so it scores
+inconsistently on the one scenario where the honest answer is "you're doing
+fine" — a rubric-fit gap being addressed by revising that golden case.
+
+LLM-as-a-Judge scores carry run-to-run variance; treat the ranges above as
+indicative, not exact.
+
+Retrieval is mocked (a fake vector store returns each scenario's golden
+context), so the suite tests the agent's *reasoning over context* and stays
+unchanged through a future ChromaDB → pgvector migration.
+
 ## Tech stack
 
 Python, FastAPI, LangChain / LangGraph, Anthropic Claude, SQLAlchemy, SQLite,
@@ -175,9 +209,9 @@ backend + bot as `launchd` agents (auto-start at login, restart on crash);
 uv run pytest evaluation/
 ```
 
-Runs the golden dataset through the real agent and grades every reply with
-three Claude-judged metrics. Makes real API calls (~3–4 min; a few dollars of
-Claude usage). Needs `ANTHROPIC_API_KEY` + `OPENAI_API_KEY`.
+See [Evaluation](#evaluation) above for what it grades. Makes real API calls
+(~3–4 min; a few dollars of Claude usage). Needs `ANTHROPIC_API_KEY` +
+`OPENAI_API_KEY`.
 
 See `CLAUDE.md` for the full architecture reference and `docs/` for detailed
 walkthroughs of specific pieces of logic.
