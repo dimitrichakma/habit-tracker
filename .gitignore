@@ -19,8 +19,9 @@ wheels/
 # launchd agent logs
 logs/
 
-# personal, not for the repo — my own code-explanation notes
+# personal, not for the repo — my own notes
 docs/code-explanations.md
+docs/re-implement-map.md
 
 # Phase 4 local vector store
 chroma_db/
