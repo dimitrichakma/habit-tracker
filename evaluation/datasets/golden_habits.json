@@ -1,0 +1,56 @@
+[
+  {
+    "name": "morning-routine-tied-to-wake-time",
+    "input": "Why do I keep failing at my morning habits? I really want to fix this.",
+    "expected_output": "This isn't a willpower problem, it's a wake-time problem. Your morning habits only fail on days you're up after 8am, and they hold every single time you're up by 7:30. Evenings are rock solid, so the routine itself works when you have the runway. Two weeks running, it's the same shape. I'd stop trying to force the morning habits directly and fix the input instead: pick one earlier, consistent wake time (even 15 minutes earlier counts) and protect it, especially on weekends where you've missed both mornings two weeks straight. Want to set a smaller 'up by 7:30' target for this week and see if the rest follows?",
+    "retrieval_context": [
+      "Across the week the morning routine (skincare, breakfast, vitamins) was completed on the 2 days the user woke before 7:30am and missed on all 4 days they woke after 8am. Evening habits held every day. The pattern was consistent: late wake-ups took out the entire morning block.",
+      "The prior week showed the same shape, with morning habits done 3 of 7 days and each success lining up with an earlier wake time. Weekend mornings were missed both days. No morning habit failed on a day the user was already up by 7:30."
+    ]
+  },
+  {
+    "name": "weekend-structure-gap",
+    "input": "I'm great on weekdays but every weekend everything falls apart. What's going on?",
+    "expected_output": "Your weekends aren't a motivation dip, they're a structure gap. The habits that collapse are the ones you hooked onto your workday (morning walk, lunchtime stretch, 6pm gym), while the ones with no fixed anchor (reading, water) sail straight through. Weekdays give you 85%. When the scaffold disappears on Saturday, so do those habits. The fix is to give the weekend its own anchors: tie the walk to breakfast, the gym to a specific weekend slot you actually keep, rather than leaning on a routine that only exists Monday to Friday. Pick one weekend habit to re-anchor this Saturday and we'll build from there.",
+    "retrieval_context": [
+      "Weekday completion averaged 85% this week; Saturday and Sunday dropped to about 20%. The habits that broke on weekends were the ones anchored to the workday structure: morning walk, lunchtime stretch, 6pm gym. Habits with no fixed time, such as reading and water, held through the weekend.",
+      "The week before showed the same split: weekdays strong, weekend completion near zero for the time-anchored habits. The user logged nothing at all on the two weekend days until Sunday night."
+    ]
+  },
+  {
+    "name": "single-habit-dragging",
+    "input": "Should I just give up on meditation? I basically never do it.",
+    "expected_output": "You don't have to give up on it, but the current version clearly isn't landing. Meditation has been under 15% for a month while everything else you track sits between 65 and 90%, so this isn't about you being inconsistent in general, it's this one habit at this one time. The pattern actually points at a fix: the few times it did happen, it was first thing in the morning, not at night when the day has already gotten away from you. Try shrinking it to two minutes, right after you wake up, for one week. If it still doesn't stick at that size and that time, then it's fair to drop it, but let's test the smaller version first.",
+    "retrieval_context": [
+      "Meditation was completed 1 of 7 days this week, continuing a multi-week low. It is consistently the last habit attempted and usually gets skipped when the day runs long. Every other habit the user tracks completed at 70% or above.",
+      "Over the past month meditation has averaged under 15% completion while the rest of the user's habits held between 65% and 90%. On the rare days it was done, it happened first thing in the morning rather than at night."
+    ]
+  },
+  {
+    "name": "self-critical-but-improving",
+    "input": "Honestly I feel like I'm failing at all of this lately.",
+    "expected_output": "I hear that it feels that way, but the data doesn't match the feeling, and that gap is worth noticing. You've gone from 49% to 58% to 72% completion over three weeks, all from steadier follow-through on habits you already had, especially the evening routine. That's real, compounding progress, not failure. There's one genuine holdout, the 8am wake time at 2 of 7 days, and it may be dragging your sense of the whole week down with it. Everything else improved or held. Let's put the attention on that one wake-time habit and let the rest keep running, because it's working.",
+    "retrieval_context": [
+      "Overall completion this week was 72%, up from 58% the week before and 49% two weeks ago, a steady three-week climb. The user added no new habits and dropped none; the gain came from more consistent follow-through on existing habits, especially the evening routine.",
+      "The only habit still clearly struggling is the 8am wake time, done 2 of 7 days. Every other tracked habit improved or held compared with the previous week."
+    ]
+  },
+  {
+    "name": "evening-habit-vs-late-nights",
+    "input": "What should I change about my reading habit? It's really hit or miss.",
+    "expected_output": "Your reading habit is fine, the problem is the window, not the habit. Two weeks straight, it happens every night you're home by 9 and gets skipped every night you're back after 10 and go straight to bed. You're not losing interest, you're losing the time. So don't try to force reading on the late nights. Instead, either move a few pages earlier in the day, like a chapter at lunch, or set a tiny late-night version such as one page that survives being tired. Which of those fits your schedule better?",
+    "retrieval_context": [
+      "Reading before bed was completed on the 3 nights the user was home by 9pm and missed on the 4 nights they worked or were out past 10pm. On late nights the user went straight to sleep. The habit is well formed on nights with time; the constraint is arrival time.",
+      "The previous week matched: reading done on early nights, skipped on late ones. It was never missed for lack of a book or interest, only for lack of an awake window."
+    ]
+  },
+  {
+    "name": "one-bad-week-with-a-cause",
+    "input": "Have I actually been slipping lately, or am I just imagining it?",
+    "expected_output": "You're not slipping, you had one bad week and it had a clear cause. Completion dropped to 55% during your work trip, but the weeks on either side are both around 80%, and you're already back to 80% now. Even in the bad week the portable habits (steps, journaling) held; it was only the location-dependent ones (home gym, kitchen breakfast) that broke, which makes sense on the road. Nothing here says decline. If anything, the useful takeaway is to pre-plan travel versions of the two or three habits that depend on being home, so the next trip costs you less.",
+    "retrieval_context": [
+      "This week completion was 80%, a recovery from a dip to 55% the week before that coincided with a work trip. Pre-trip weeks were also around 80%. The dip was a single bad week tied to travel, not a downward trend.",
+      "During the travel week the habits that broke were location-dependent, such as the home gym and kitchen breakfast, while portable habits like steps and journaling held. Since returning, all habits are back to pre-trip levels."
+    ]
+  }
+]

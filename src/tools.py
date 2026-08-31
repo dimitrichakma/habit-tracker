@@ -10,6 +10,7 @@ from langchain.tools import ToolRuntime
 from langchain_core.tools import tool
 
 from .database import Habit, HabitLog, get_session, is_due_today, is_satisfied, satisfaction_window_days
+from .vector_store import get_habit_memory_store
 
 
 def _current_user_id(runtime: ToolRuntime) -> int:
@@ -321,6 +322,39 @@ def get_habit_history_pattern(habit_name: str, *, runtime: ToolRuntime) -> str:
 
 
 @tool
+def query_past_behavior(topic: str, *, runtime: ToolRuntime) -> str:
+    """Search the user's stored weekly behavioral summaries (their long-term
+    memory) for context relevant to `topic`, returning up to 3 of the most
+    similar.
+
+    Call this BEFORE giving advice, BEFORE answering "why do I keep failing at
+    X", and BEFORE reflecting on the user's longer-term patterns — it grounds
+    the coaching in what actually happened over past weeks instead of guessing.
+
+    Args:
+        topic: A short description of the behaviour/theme to recall, e.g.
+            "evening exercise consistency" or "why morning habits slip".
+    """
+    user_id = _current_user_id(runtime)
+    # Generic LangChain VectorStore.similarity_search interface — never a
+    # Chroma-specific call — so this survives the Phase 5 pgvector swap and
+    # the eval suite can mock it at the vector-store level. Scoped to the
+    # caller's own user_id via the metadata filter; user_id comes from
+    # ToolRuntime, never from the LLM.
+    documents = get_habit_memory_store().vectorstore.similarity_search(
+        topic, k=3, filter={"user_id": user_id}
+    )
+    if not documents:
+        return (
+            "No past behavioral summaries are stored for this user yet (they "
+            "accumulate one per week). Coach from this conversation and the live "
+            "habit data instead."
+        )
+    lines = [f"{index}. {doc.page_content}" for index, doc in enumerate(documents, start=1)]
+    return "Relevant past behavioral summaries (most similar first):\n" + "\n".join(lines)
+
+
+@tool
 def delete_habit(habit_name: str, *, runtime: ToolRuntime) -> str:
     """Permanently delete a habit and all of its logged history.
 
@@ -350,5 +384,6 @@ TOOLS = [
     list_habits,
     get_weekly_summary,
     get_habit_history_pattern,
+    query_past_behavior,
     delete_habit,
 ]

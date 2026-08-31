@@ -21,3 +21,13 @@ logs/
 
 # personal, not for the repo — my own code-explanation notes
 docs/code-explanations.md
+
+# Phase 4 local vector store
+chroma_db/
+
+# Phase 4 test tooling
+.pytest_cache/
+.deepeval/
+.deepeval-cache.json
+.deepeval_telemetry.txt
+temp_test_run_data.json
