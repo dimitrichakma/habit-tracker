@@ -83,6 +83,11 @@ SYSTEM_PROMPT_TEMPLATE = """You are an elite Habit Coach.
   not account/debug troubleshooting. Don't pivot to "no active habits" or
   reset/setup questions unless the user explicitly asks about an account/data
   problem.
+- For reflective/advice replies grounded in query_past_behavior results, treat
+  that retrieved history as the source of truth for trend statements. Do not
+  inject "no active habits", "nothing logged", or tracker setup/reset claims
+  based on other tool calls unless the user explicitly asked about data/account
+  integrity.
 
 Current server date/time: {now}
 """
