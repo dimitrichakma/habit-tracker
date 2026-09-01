@@ -1,17 +1,20 @@
 """FastAPI service exposing the habit coaching agent over HTTP."""
 
 import logging
-from contextlib import asynccontextmanager
+import os
+from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import date, timedelta
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from langchain_core.messages import AIMessage, HumanMessage
 from pydantic import BaseModel, Field
+from telegram import Update
 
 load_dotenv()
 
-from .agent import build_agent
+from .agent import build_agent, postgres_checkpointer
+from .bot import build_application
 from .auth import (
     create_access_token,
     get_current_user_id,
@@ -35,23 +38,95 @@ from .scheduler import run_friction_nudge, start_reminder_scheduler
 # every request through httpx at INFO with the bot token in the URL — keep
 # httpx at WARNING so the token never lands in the server logs.
 logging.getLogger("httpx").setLevel(logging.WARNING)
+logger = logging.getLogger(__name__)
+
+
+def _checkpointer_conninfo() -> str | None:
+    """Neon's DIRECT endpoint as a libpq URL for the agent's Postgres
+    checkpointer, or None to fall back to SQLite (local dev without Postgres).
+    Direct, not pooled: the checkpointer uses server-side prepared statements
+    that PgBouncer transaction pooling rejects (see agent.postgres_checkpointer).
+    """
+    url = os.environ.get("DATABASE_URL_DIRECT") or os.environ.get("DATABASE_URL", "")
+    if not url.startswith(("postgresql://", "postgres://")):
+        return None
+    return url.replace("postgresql+psycopg://", "postgresql://", 1)
+
+
+async def _telegram_reply(message_text: str) -> str:
+    """Drive the shared agent for one inbound Telegram message, acting as the
+    single configured account (HABIT_TRACKER_USERNAME). This is the callback
+    src/bot.py's message handler invokes — it mirrors POST /chat, minus the
+    JWT: on Telegram, identity is the fixed account, resolved server-side
+    here, never taken from the message."""
+    username = os.environ["HABIT_TRACKER_USERNAME"]
+    session = get_session()
+    try:
+        user = session.query(User).filter(User.username == username).first()
+        if user is None:
+            raise RuntimeError(f"No account for HABIT_TRACKER_USERNAME={username!r}")
+        user_id = user.id
+    finally:
+        session.close()
+
+    result = await app.state.agent.ainvoke(
+        {"messages": [{"role": "user", "content": message_text}]},
+        config={"configurable": {"thread_id": str(user_id)}},
+    )
+    return _as_text(result["messages"][-1].content)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Runs once at server startup/shutdown (not per-request). Prepares the
-    database, starts the daily Telegram reminder scheduler (Phase 2), and
-    builds one shared agent instance that every request reuses for the life
-    of the process — see build_agent()'s docstring for why."""
+    database, wires the agent's per-conversation checkpointer (Postgres in
+    deployment, SQLite locally), starts the daily Telegram reminder scheduler
+    (Phase 2), builds one shared agent instance that every request reuses for
+    the life of the process (see build_agent()'s docstring), and drives the
+    Telegram bot in-process via webhook (src/bot.py — no polling)."""
     init_db()
-    # Build the agent first: the scheduler's 20:00 job (Phase 3) invokes it
-    # to generate the nudge text, so it must exist before the job is added.
-    async with build_agent() as agent:
+    async with AsyncExitStack() as stack:
+        conninfo = _checkpointer_conninfo()
+        checkpointer = (
+            await stack.enter_async_context(postgres_checkpointer(conninfo))
+            if conninfo
+            else None
+        )
+        # Build the agent first: the scheduler's 20:00 job (Phase 3) invokes it
+        # to generate the nudge text, so it must exist before the job is added.
+        agent = await stack.enter_async_context(build_agent(checkpointer=checkpointer))
         app.state.agent = agent
         scheduler = start_reminder_scheduler(agent)
+
+        # Telegram: build the Application, drive it in-process. Updates arrive
+        # at POST /webhook/telegram, which calls telegram_app.process_update().
+        telegram_app = build_application(on_message=_telegram_reply)
+        app.state.telegram_app = telegram_app
+        await telegram_app.initialize()
+        await telegram_app.start()
+
+        webhook_url = os.environ.get("TELEGRAM_WEBHOOK_URL")
+        secret_token = os.environ.get("WEBHOOK_SECRET_TOKEN")
+        if webhook_url:
+            try:
+                await telegram_app.bot.set_webhook(url=webhook_url, secret_token=secret_token)
+                logger.info("Telegram webhook registered at %s", webhook_url)
+            except Exception:
+                # The real public URL often isn't known until after the first
+                # deploy (Cloud Run). Don't let that block startup — the
+                # webhook can be set once the URL exists.
+                logger.warning(
+                    "Could not register the Telegram webhook at %s — set it "
+                    "manually once the public URL is known.", webhook_url, exc_info=True
+                )
+        else:
+            logger.warning("TELEGRAM_WEBHOOK_URL not set — skipping webhook registration.")
+
         try:
             yield
         finally:
+            await telegram_app.stop()
+            await telegram_app.shutdown()
             scheduler.shutdown(wait=False)
 
 
@@ -354,3 +429,35 @@ async def chat_history(user_id: int = Depends(get_current_user_id)) -> ChatHisto
         # they're internal plumbing, not part of the visible conversation.
 
     return ChatHistory(messages=history)
+
+
+@app.get("/healthz")
+async def healthz() -> dict[str, str]:
+    """Liveness probe (Cloud Run / load balancer health checks)."""
+    return {"status": "ok"}
+
+
+@app.post("/webhook/telegram")
+async def telegram_webhook(
+    request: Request,
+    x_telegram_bot_api_secret_token: str | None = Header(default=None),
+) -> dict[str, bool]:
+    """Telegram delivers updates here (URL registered via set_webhook in the
+    lifespan). Telegram echoes the secret token we set on every request, in
+    the X-Telegram-Bot-Api-Secret-Token header — that's what proves the call
+    is really from Telegram. Any mismatch or missing header → 401."""
+    expected = os.environ.get("WEBHOOK_SECRET_TOKEN")
+    if not x_telegram_bot_api_secret_token or x_telegram_bot_api_secret_token != expected:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    telegram_app = app.state.telegram_app
+    update = Update.de_json(await request.json(), telegram_app.bot)
+    await telegram_app.process_update(update)
+    return {"ok": True}
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    # Cloud Run injects PORT; bind all interfaces so the container is reachable.
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))

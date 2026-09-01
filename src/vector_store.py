@@ -1,11 +1,11 @@
 """Vector store access for semantic habit memory (Phase 4).
 
 `HabitMemoryStore` is the ONE place the rest of the app touches the vector
-database — swap ChromaDB for pgvector in Phase 5 by rewriting this file only.
-Internally it holds a LangChain `Chroma` VectorStore and exposes it via
-`.vectorstore`, so `tools.query_past_behavior` calls the *generic*
-`VectorStore.similarity_search` interface, never a Chroma-specific API. That
-keeps the tool (and its test mock) independent of the backing store.
+database. Internally it now holds a LangChain `PGVector` store (pgvector on the
+same Postgres/Neon database as the relational tables — was ChromaDB) and
+exposes it via `.vectorstore`, so `tools.query_past_behavior` calls the
+*generic* `VectorStore.similarity_search` interface, never a backend-specific
+API. That keeps the tool (and its test mock) independent of the backing store.
 
 Embeddings: OpenAI `text-embedding-3-small` via `langchain_openai`
 (`OPENAI_API_KEY` required). This is the one deliberate non-Anthropic piece
@@ -22,37 +22,65 @@ from __future__ import annotations
 
 import os
 
-from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_core.vectorstores import VectorStore
 from langchain_openai import OpenAIEmbeddings
+from langchain_postgres import PGVector
 
-CHROMA_PATH = os.environ.get("CHROMA_PATH", "chroma_db")
-COLLECTION_NAME = os.environ.get("HABIT_MEMORY_COLLECTION", "habit_memory")
+COLLECTION_NAME = os.environ.get("HABIT_MEMORY_COLLECTION", "habit_summaries")
 EMBEDDING_MODEL = "text-embedding-3-small"
 
 
-class HabitMemoryStore:
-    """Wrapper over one LangChain `Chroma` collection of weekly behavioral
-    summaries. The swap boundary for Phase 5's move to pgvector."""
+def _connection_url() -> str:
+    """The Postgres URL for pgvector — same database as the relational tables.
+    Forces the psycopg (v3) driver, which is what's installed."""
+    url = os.environ["DATABASE_URL"]
+    if url.startswith("postgresql+"):
+        return url
+    if url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql://", 1)
+    return url.replace("postgresql://", "postgresql+psycopg://", 1)
 
-    def __init__(
-        self,
-        *,
-        path: str = CHROMA_PATH,
-        collection_name: str = COLLECTION_NAME,
-    ) -> None:
-        self._vectorstore = Chroma(
-            collection_name=collection_name,
-            embedding_function=OpenAIEmbeddings(model=EMBEDDING_MODEL),
-            persist_directory=path,
+
+_vector_store: PGVector | None = None
+
+
+def get_vector_store() -> PGVector:
+    """Process-wide `PGVector` over the `habit_summaries` collection. Created
+    lazily (first use), then reused so a single engine/pool is shared.
+
+    `create_extension=True` (the default) has PGVector run
+    `CREATE EXTENSION IF NOT EXISTS vector` itself; `database.init_db()` also
+    does it — both are idempotent. `use_jsonb=True` stores metadata as JSONB,
+    which is what the `{"user_id": ...}` read filter queries against.
+    """
+    global _vector_store
+    if _vector_store is None:
+        _vector_store = PGVector(
+            embeddings=OpenAIEmbeddings(model=EMBEDDING_MODEL),
+            collection_name=COLLECTION_NAME,
+            connection=_connection_url(),
+            use_jsonb=True,
+            # Keep psycopg3 prepared statements off so Neon's pooled endpoint
+            # ("-pooler" host, PgBouncer) works, matching database.py.
+            engine_args={"connect_args": {"prepare_threshold": None}},
         )
+    return _vector_store
+
+
+class HabitMemoryStore:
+    """Wrapper over the `habit_summaries` pgvector collection of weekly
+    behavioral summaries. The single boundary the rest of the app goes
+    through to reach the vector database."""
+
+    def __init__(self) -> None:
+        self._vectorstore = get_vector_store()
 
     @property
     def vectorstore(self) -> VectorStore:
         """The backing LangChain VectorStore. Callers use its generic
         `.similarity_search(query, k=..., filter=...)` — never a
-        Chroma-specific method."""
+        backend-specific method."""
         return self._vectorstore
 
     def add_summary(
@@ -64,7 +92,8 @@ class HabitMemoryStore:
         metadata: dict | None = None,
     ) -> None:
         """Insert or replace one summary. `doc_id` is stable per (user, week),
-        so re-running a week's summarization overwrites rather than duplicates."""
+        so re-running a week's summarization overwrites rather than duplicates
+        (PGVector.add_texts upserts on explicit ids)."""
         meta: dict = {"user_id": int(user_id)}
         if metadata:
             meta.update(metadata)
@@ -84,8 +113,8 @@ _store: HabitMemoryStore | None = None
 
 
 def get_habit_memory_store() -> HabitMemoryStore:
-    """Process-wide singleton. Tests swap this module's `_store` to point
-    elsewhere."""
+    """Process-wide singleton. Tests swap this module's `_store` (or patch
+    this accessor) to point elsewhere."""
     global _store
     if _store is None:
         _store = HabitMemoryStore()

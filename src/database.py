@@ -1,19 +1,53 @@
-"""SQLite/SQLAlchemy models and table setup for the habit tracker."""
+"""SQLAlchemy models and table setup for the habit tracker.
 
+Storage is Postgres (Neon, with the `pgvector` extension) in deployment and
+SQLite locally / in the eval suite. Only the engine wiring below cares which
+one it is — the models, relationships, per-user scoping, and every piece of
+business logic (`is_due_today`, `is_satisfied`, `_migrate_add_habits_user_id`,
+`backfill_orphaned_habits`) are identical on both.
+"""
+
+import os
 import re
 from datetime import date, datetime, timedelta
 
-from sqlalchemy import Date, DateTime, ForeignKey, String, create_engine
+from sqlalchemy import Date, DateTime, ForeignKey, String, create_engine, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
-DATABASE_URL = "sqlite:///habits.db"
+# Neon (or any Postgres) via DATABASE_URL; falls back to a local SQLite file so
+# `import src.database` never hard-fails when the var is unset (local dev, and
+# the Phase 4 eval suite, which swaps in its own throwaway SQLite engine).
+DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///habits.db")
 
-#  check_same_thread=False: SQLite normally refuses to let a connection be
-# used from a different thread than the one that created it. FastAPI can
-# handle requests on different worker threads, so this relaxes that check —
-# safe here since every request opens (and closes) its own fresh session
-# via get_session() rather than sharing one connection across requests.
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+
+def _normalize_pg_url(url: str) -> str:
+    """Force the psycopg (v3) driver. SQLAlchemy maps a bare `postgresql://`
+    to psycopg2, which isn't installed; Neon hands out bare URLs."""
+    if url.startswith("postgresql+"):
+        return url
+    if url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql://", 1)
+    return url.replace("postgresql://", "postgresql+psycopg://", 1)
+
+
+if DATABASE_URL.startswith("sqlite"):
+    #  check_same_thread=False: SQLite normally refuses to let a connection be
+    # used from a different thread than the one that created it. FastAPI can
+    # handle requests on different worker threads, so this relaxes that check —
+    # safe here since every request opens (and closes) its own fresh session
+    # via get_session() rather than sharing one connection across requests.
+    engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+else:
+    # pool_pre_ping: Neon drops idle connections; ping-and-reconnect instead of
+    # handing out a dead one. prepare_threshold=None: disable psycopg3 prepared
+    # statements so the same URL works through Neon's pooled (PgBouncer /
+    # "-pooler") endpoint as well as the direct one.
+    engine = create_engine(
+        _normalize_pg_url(DATABASE_URL),
+        pool_pre_ping=True,
+        connect_args={"prepare_threshold": None},
+    )
+
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 
@@ -64,8 +98,14 @@ class HabitLog(Base):
 
 
 def init_db() -> None:
+    if engine.dialect.name == "postgresql":
+        # pgvector's tables (langchain_pg_*) live in the same database; the
+        # extension has to exist before the vector store creates them.
+        with engine.begin() as conn:
+            conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
     Base.metadata.create_all(bind=engine)
-    _migrate_add_habits_user_id()
+    if engine.dialect.name == "sqlite":
+        _migrate_add_habits_user_id()
 
 
 def _migrate_add_habits_user_id() -> None:
@@ -75,6 +115,9 @@ def _migrate_add_habits_user_id() -> None:
     PRAGMA table_info first, so it's always safe to call on every startup.
     A fresh database never hits this path: create_all() above already
     creates user_id as NOT NULL from row one when the table doesn't exist yet.
+
+    SQLite only — Postgres deployments start post-auth, so there is no
+    pre-auth column to backfill, and PRAGMA isn't valid Postgres anyway.
     """
     with engine.connect() as conn:
         columns = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(habits)")}

@@ -6,7 +6,10 @@ from datetime import datetime
 from langchain.agents import create_agent
 from langchain.agents.middleware import ModelRequest, dynamic_prompt
 from langchain_anthropic import ChatAnthropic
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from psycopg.rows import dict_row
+from psycopg_pool import AsyncConnectionPool
 
 from .tools import TOOLS
 
@@ -16,6 +19,10 @@ from .tools import TOOLS
 # from main.py's JWT auth, never a client-supplied string.
 
 MODEL_NAME = "claude-sonnet-5"
+# SQLite fallback checkpoint file — used only when build_agent() gets no
+# checkpointer (local dev without a Postgres URL, and the Phase 4 eval suite,
+# which monkeypatches this constant to a temp path). Deployment runs on
+# AsyncPostgresSaver instead (see postgres_checkpointer / main.py's lifespan).
 CHECKPOINT_DB = "checkpoints.db"
 
 SYSTEM_PROMPT_TEMPLATE = """You are an elite Habit Coach.
@@ -89,19 +96,65 @@ def habit_coach_prompt(_request: ModelRequest) -> str:
 
 
 @asynccontextmanager
-async def build_agent():
-    """Yield a compiled agent whose conversation memory is persisted to
-    SQLite. Called once at server startup (see main.py's lifespan) — one
-    shared agent instance serves every user for the whole life of the
-    process. Per-user isolation doesn't come from separate agent instances;
-    it comes entirely from the thread_id passed into each ainvoke() call
-    plus the tool-level ToolRuntime scoping in tools.py."""
+async def postgres_checkpointer(conninfo: str):
+    """Yield an `AsyncPostgresSaver` backed by a small managed connection
+    pool. main.py's lifespan enters this in deployment and passes the saver
+    to `build_agent()`; the pool is opened and closed here.
+
+    `conninfo` must be a libpq URL (`postgresql://…`, NOT the SQLAlchemy
+    `postgresql+psycopg://` form) — use Neon's DIRECT endpoint, not the
+    pooled one: the saver runs with `prepare_threshold=0` (server-side
+    prepared statements), which PgBouncer transaction pooling rejects.
+
+    `check=check_connection` revalidates a connection on checkout, so a
+    connection left stale by Neon suspending an idle compute is replaced
+    rather than handed out dead.
+    """
+    pool = AsyncConnectionPool(
+        conninfo=conninfo,
+        min_size=1,
+        max_size=4,
+        open=False,
+        kwargs={"autocommit": True, "prepare_threshold": 0, "row_factory": dict_row},
+        check=AsyncConnectionPool.check_connection,
+    )
+    await pool.open(wait=True)
+    try:
+        saver = AsyncPostgresSaver(pool)
+        await saver.setup()  # idempotent: creates the checkpoint tables if absent
+        yield saver
+    finally:
+        await pool.close()
+
+
+@asynccontextmanager
+async def build_agent(checkpointer=None):
+    """Yield a compiled agent whose per-thread conversation memory is
+    persisted by `checkpointer`. Called once at server startup (see main.py's
+    lifespan) — one shared agent instance serves every user for the whole
+    life of the process. Per-user isolation doesn't come from separate agent
+    instances; it comes entirely from the thread_id passed into each
+    ainvoke() call plus the tool-level ToolRuntime scoping in tools.py.
+
+    `checkpointer` is the `AsyncPostgresSaver` from `postgres_checkpointer()`,
+    passed down by the deployment lifespan. If it's None — the Phase 4 eval
+    suite calls `build_agent()` with no args, and local dev without a Postgres
+    URL — an `AsyncSqliteSaver` on `CHECKPOINT_DB` is used instead, so tests
+    and laptops never need Postgres.
+    """
     model = ChatAnthropic(model=MODEL_NAME)
-    async with AsyncSqliteSaver.from_conn_string(CHECKPOINT_DB) as checkpointer:
-        agent = create_agent(
+
+    def _compile(saver):
+        return create_agent(
             model,
             tools=TOOLS,
             middleware=[habit_coach_prompt],
-            checkpointer=checkpointer,
+            checkpointer=saver,
         )
-        yield agent
+
+    if checkpointer is not None:
+        yield _compile(checkpointer)
+        return
+
+    async with AsyncSqliteSaver.from_conn_string(CHECKPOINT_DB) as sqlite_saver:
+        yield _compile(sqlite_saver)
