@@ -1,10 +1,12 @@
 # Project Overview
 - AI Habit Tracker — chat-based habit coaching agent (Anthropic-powered)
-  with a Streamlit dashboard, FastAPI backend, SQLite storage.
+  with a Streamlit dashboard, FastAPI backend, PostgreSQL (Neon) +
+  pgvector storage. Backend deployed on Railway.
 - Phase 1 (complete): chat to create/log habits, live Today's Dashboard,
   real per-user JWT auth, Progress tab with interactive Plotly charts.
 - Phase 2 (complete): Telegram bot + daily 8PM reminder scheduler,
-  single-user scope, proactive JWT refresh.
+  single-user scope. (The bot's proactive-JWT-refresh mechanism was
+  removed in Phase 5 when it moved in-process — see below.)
 - Phase 3 (complete): pattern-aware coaching (checks a habit's own
   failure history, suggests a smaller micro-commitment), natural-language
   multi-habit logging in one message, manual `/evaluate_friction` test
@@ -18,35 +20,64 @@
   is used for exactly two non-reasoning things: the vector embeddings
   (`text-embedding-3-small`) and DeepEval's base dependency. `.env` now
   needs `OPENAI_API_KEY`.
-- Phase 5 (planned): database + deployment hardening, in this order —
-  (1) migrate SQLite → PostgreSQL and ChromaDB → pgvector, (2)
-  containerize the whole app (FastAPI + Streamlit + Telegram bot) into
-  one Docker image supervised by `supervisord`, (3) CI/CD via GitHub
-  Actions building/pushing that image to a registry and deploying it.
-  Migration first, then containerize, so the image isn't rebuilt twice.
+- Phase 5 (complete): database + deployment.
+  - **Storage:** SQLite → PostgreSQL (Neon), ChromaDB → pgvector. ONE Neon
+    database now holds the relational tables, the agent's per-thread
+    checkpoint tables, and the weekly-summary vectors.
+  - **Checkpointer:** `AsyncSqliteSaver` → `AsyncPostgresSaver` (a small
+    managed pool on Neon's DIRECT endpoint; SQLite on `CHECKPOINT_DB` is
+    the fallback for local dev and the eval suite).
+  - **Telegram:** the long-polling `src/bot.py` process → a webhook merged
+    into `main.py`. `bot.py` is kept as a module (builds the
+    `python-telegram-bot` Application + handlers); `main.py`'s lifespan
+    drives it and registers the webhook.
+  - **Deployment:** the FastAPI backend is containerized (`Dockerfile`)
+    and runs on **Railway** (rebuilds on `git push` to `main`). The
+    Streamlit frontend is prepared for **Streamlit Cloud** (env-driven
+    `BACKEND_BASE_URL`, a slim `requirements.txt`) but the deploy step is
+    manual and not yet done. No `supervisord`, no GitHub Actions pipeline —
+    the two services deploy independently.
+  - The original plan routed through AWS then GCP; both were abandoned
+    (GCP's org policies made public Cloud Run unworkable). Railway is the
+    final answer.
 
 # Tech Stack
-- Backend: FastAPI, LangGraph, LangChain (Anthropic), SQLAlchemy, SQLite
+- Backend: FastAPI, LangGraph, LangChain (Anthropic), SQLAlchemy,
+  PostgreSQL (Neon) + pgvector
 - Frontend: Streamlit, Plotly
 - Auth: bcrypt (not passlib — incompatible with bcrypt≥4.1), pyjwt
-- Phase 2: python-telegram-bot (v20+, async), apscheduler, httpx
+- Phase 2: python-telegram-bot (v22, async — webhook, not polling), apscheduler
 - Phase 3: `mcp` (FastMCP, standalone learning server only)
-- Phase 4: `chromadb` + `langchain-chroma` (vector store), `langchain-openai`
-  (`text-embedding-3-small` embeddings only), `deepeval` + `pytest` +
-  `pytest-asyncio` (all in `[project.dependencies]`, per the phase spec).
+- Phase 4: `langchain-openai` (`text-embedding-3-small` embeddings only),
+  `deepeval` + `pytest` + `pytest-asyncio` (still in `[project.dependencies]`).
+- Phase 5: `psycopg[binary,pool]`, `pgvector`, `langchain-postgres`
+  (`PGVector`), `langgraph-checkpoint-postgres`. Removed: `chromadb`,
+  `langchain-chroma`. `langgraph-checkpoint-sqlite` kept (checkpointer
+  fallback). Deploy: `Dockerfile` + `.dockerignore` + `requirements.txt`
+  (Streamlit Cloud); Railway (backend), Neon (Postgres), Streamlit Cloud
+  (frontend, pending).
 - Package manager: uv
 - `create_agent` lives in `langchain.agents`, not `langchain-anthropic`
 
 # Project Structure
 - `src/__init__.py` — package root; relative imports throughout; run via
   `uvicorn src.main:app` from project root.
-- `src/database.py` — models + shared logic.
+- `src/database.py` — models + shared logic. **Sync** SQLAlchemy (the
+  tool layer stays synchronous; only the checkpointer is async).
+  - Engine reads `DATABASE_URL`; falls back to `sqlite:///habits.db` when
+    unset (local dev, and the eval suite, which swaps in its own throwaway
+    SQLite). `_normalize_pg_url()` forces the `postgresql+psycopg://`
+    driver; Postgres engine uses `pool_pre_ping=True` +
+    `connect_args={"prepare_threshold": None}` so the SAME url works on
+    Neon's POOLED (PgBouncer / `-pooler`) endpoint.
   - `User(id, username, hashed_password)`; `Habit(id, user_id FK, name,
     frequency)`; `HabitLog(id, habit_id, date, status)`.
   - `frequency`/`status` are free text, not enums.
-  - `init_db()` additive/idempotent, never drops data; handles the
-    nullable-column migration + `backfill_orphaned_habits()` for
-    pre-auth data.
+  - `init_db()` additive/idempotent, never drops data. On Postgres it runs
+    `CREATE EXTENSION IF NOT EXISTS vector` (for pgvector's tables). The
+    nullable-column migration `_migrate_add_habits_user_id()` is
+    **SQLite-only** (guarded on `engine.dialect.name`; `PRAGMA` isn't
+    valid Postgres). `backfill_orphaned_habits()` unchanged.
   - `is_due_today()` / `is_satisfied()` — single source of truth for
     frequency logic (rolling 7-day "weekly", skip "except <Weekday>",
     `status=="done"`-only). Used everywhere pending/satisfied status is
@@ -65,11 +96,11 @@
     Mondays"), pure SQL, no schema change.
   - `query_past_behavior(topic)` — **Phase 4**. Calls the generic
     LangChain `VectorStore.similarity_search` interface (never a
-    Chroma-specific API — required both for test mocking and the planned
-    Phase 5 pgvector swap) against the `habit_memory` collection,
-    filtered to the caller's own `user_id` (via `ToolRuntime`, same as
-    every other tool — never an LLM-supplied value). Returns top 3
-    matches.
+    backend-specific API — this is exactly why the Phase 5 pgvector
+    migration didn't touch this function or its tests) against the
+    `habit_summaries` collection, filtered to the caller's own `user_id`
+    (via `ToolRuntime`, same as every other tool — never an LLM-supplied
+    value). Returns top 3 matches. Unchanged by Phase 5.
   - Name resolution via `_find_habit`: exact → case-insensitive substring
     → asks to disambiguate on multiple matches.
 - `src/agent.py` — built via `langchain.agents.create_agent` (never the
@@ -79,8 +110,16 @@
   - Dynamic system prompt via `@dynamic_prompt` middleware
     (`langchain.agents.middleware`) — NOT a callable to `system_prompt=`
     (unsupported). Injects current date/time.
-  - Memory: `AsyncSqliteSaver`, keyed by `thread_id`. `build_agent()` is
-    an `@asynccontextmanager`, one shared instance per server lifetime.
+  - Memory (**Phase 5**): `AsyncPostgresSaver`, keyed by `thread_id`.
+    `build_agent(checkpointer=None)` is an `@asynccontextmanager`, one
+    shared instance per server lifetime; `main.py`'s lifespan passes it
+    the saver from `postgres_checkpointer(conninfo)` (a small managed
+    `AsyncConnectionPool` on Neon's DIRECT endpoint — the saver uses
+    server-side prepared statements, which PgBouncer transaction pooling
+    rejects). With `checkpointer=None` it falls back to `AsyncSqliteSaver`
+    on `CHECKPOINT_DB` — that's the path the eval suite and a
+    Postgres-less laptop take. `CHECKPOINT_DB` is kept as a constant so
+    the eval suite's monkeypatch of it stays a harmless no-op.
   - Persona: elite Habit Coach, concise, accountable, never guesses data
     — calls tools fresh every time, never assumes state from earlier turns.
   - **Phase 3**: on a reported missed habit, checks
@@ -97,7 +136,15 @@
   `get_current_user_id` dependency. Leaf module, no import cycles. Reads
   `JWT_SECRET_KEY` at import time, fails fast if unset. Tokens expire in
   24h, no refresh flow.
-- `src/main.py` — FastAPI app.
+- `src/main.py` — FastAPI app. The `lifespan` (Phase 5) does, in order:
+  `init_db()` → open the Postgres checkpointer pool (if a Postgres
+  `DATABASE_URL`/`DATABASE_URL_DIRECT` is set, else `None`) →
+  `build_agent(checkpointer=…)` → `start_reminder_scheduler(agent)` →
+  build the Telegram `Application` via `bot.build_application(_telegram_reply)`,
+  `initialize()` / `start()` it, and `set_webhook(TELEGRAM_WEBHOOK_URL,
+  secret_token=WEBHOOK_SECRET_TOKEN)` (non-fatal — logs a warning if the
+  URL is a placeholder). Teardown reverses it (`delete`/`stop`/`shutdown`,
+  scheduler shutdown, pool close) via one `AsyncExitStack`.
   - `POST /auth/signup`, `POST /auth/login` → JWT.
   - `POST /chat` — `{message}` only, identity from JWT via
     `Depends(get_current_user_id)`, never client-supplied.
@@ -109,15 +156,32 @@
     `user_id` — this was the exact vulnerability already fixed once in
     `/chat`, never reintroduce it here. Runs the same
     pending-habits-then-agent-nudge flow the scheduler runs automatically.
+  - `POST /webhook/telegram` — **Phase 5**. Telegram POSTs updates here.
+    Checks `X-Telegram-Bot-Api-Secret-Token` == `WEBHOOK_SECRET_TOKEN`
+    (401 on mismatch/missing), parses the `Update`, calls
+    `telegram_app.process_update(update)`, returns 200.
+  - `GET /healthz` — **Phase 5**. `{"status": "ok"}`, no DB/agent touch.
+  - `_telegram_reply(text)` — the callback handed to `build_application`.
+    Resolves `HABIT_TRACKER_USERNAME` → `user_id`, invokes the shared
+    agent with that as `thread_id` (mirrors `/chat`, minus the JWT).
+  - `__main__` runs `uvicorn.run(app, host="0.0.0.0",
+    port=int(os.environ.get("PORT", 8080)))` — the container entrypoint
+    (`Dockerfile` CMD is `uv run python -m src.main`; Railway injects PORT).
 - `src/app.py` — Streamlit frontend. NO LangChain/LangGraph logic, HTTP
-  only. Login/signup gate, JWT in `st.session_state` only. Drops to login
-  on `401`. Chat tab + Progress tab (Plotly trend/heatmap, KPI row).
-- `src/bot.py` — **Phase 2**. Own process, independently runnable. NO
-  LangChain/LangGraph/DB logic — HTTP only. Logs in via `/auth/login`
-  using `HABIT_TRACKER_USERNAME`/`PASSWORD`, caches JWT + issue time.
-  Proactively refreshes before ~23h of age; 401-retry is a fallback only,
-  not the primary mechanism. Forwards Telegram messages to `/chat`.
-- `src/scheduler.py` — **Phase 2/3/4**. Runs in-process with FastAPI
+  only. `BACKEND_BASE_URL = os.environ.get("BACKEND_BASE_URL",
+  "http://localhost:8000")` (**Phase 5** — Streamlit Cloud sets it via
+  app secrets). Login/signup gate, JWT in `st.session_state` only. Drops
+  to login on `401`. Chat tab + Progress tab (Plotly trend/heatmap, KPI row).
+- `src/bot.py` — **Phase 2, rewritten Phase 5.** A module, NOT a process —
+  no polling, no `__main__`. `build_application(on_message)` builds the
+  `python-telegram-bot` `Application` + handlers and stashes the
+  `on_message` callback in `bot_data`; `_handle_message` calls it.
+  Still no LangChain/LangGraph/DB imports — `main.py` injects the
+  agent-calling callback (`_telegram_reply`). The old `BackendClient` /
+  `/auth/login` / proactive-JWT-refresh machinery is gone (it only
+  existed because the bot was a separate HTTP client).
+- `src/scheduler.py` — **Phase 2/3/4**, unchanged in Phase 5. Runs
+  in-process with FastAPI
   (trusted context — may import `database.py` directly, unlike `bot.py`).
   One shared `AsyncIOScheduler` instance, two jobs:
   - Daily 20:00 — resolves `User.id` from `HABIT_TRACKER_USERNAME`,
@@ -128,24 +192,31 @@
   - Both jobs share this one scheduler instance — never a second one.
 - `src/mcp_server.py` — **Phase 3, standalone learning exercise, NOT
   connected to the production agent.** FastMCP, stdio transport, run
-  independently (Claude Desktop, MCP Inspector), reads/writes the same
-  `habits.db`. Exposes `log_habit`, `get_pending_habits`, `list_habits`,
-  `get_weekly_summary` — never `delete_habit` (its only safety net is the
-  main app's confirm-before-delete prompt, not the tool itself). Identity
-  fixed once at server startup via `HABIT_TRACKER_USERNAME` env var — no
-  tool takes a `user_id` parameter.
-- `src/vector_store.py` — **Phase 4**. `HabitMemoryStore` — the ONE place
-  the app touches the vector DB (swap ChromaDB → pgvector in Phase 5 by
-  rewriting this file only). Holds a LangChain `Chroma` and exposes it as
-  `.vectorstore` (a generic `VectorStore`), so callers use
-  `.similarity_search(query, k=…, filter={"user_id": …})` and never a
-  Chroma-specific method. Surface: `add_summary(doc_id, text, user_id,
-  metadata)`, `similarity_search(...)`, `get_habit_memory_store()`
-  singleton. Embeddings: `OpenAIEmbeddings("text-embedding-3-small")` —
+  independently (Claude Desktop, MCP Inspector). Reuses the `tools.py`
+  functions via a `_FixedRuntime` stand-in; identity fixed once at
+  startup via `HABIT_TRACKER_USERNAME`. Exposes `log_habit`,
+  `get_pending_habits`, `list_habits`, `get_weekly_summary` — never
+  `delete_habit`. It imports `database.py`, so with a Postgres
+  `DATABASE_URL` set it now talks to Neon too (Phase 5 side effect, not a
+  deliberate wiring).
+- `src/vector_store.py` — **Phase 4, rewritten Phase 5.** `HabitMemoryStore`
+  — the ONE place the app touches the vector DB, and the single file the
+  ChromaDB → pgvector migration changed. Now wraps a
+  `langchain_postgres.PGVector` (`collection_name="habit_summaries"`,
+  `use_jsonb=True`), built lazily by `get_vector_store() -> PGVector` and
+  reused. Still exposes `.vectorstore` (a generic `VectorStore`) so
+  callers use `.similarity_search(query, k=…, filter={"user_id": …})` and
+  never a backend-specific method. Same surface: `add_summary(doc_id,
+  text, user_id, metadata)`, `similarity_search(...)`,
+  `get_habit_memory_store()` singleton. Connects to `DATABASE_URL`
+  (normalized to `postgresql+psycopg://`) with `engine_args`
+  `connect_args={"prepare_threshold": None}` for Neon's pooled endpoint.
+  Embeddings unchanged: `OpenAIEmbeddings("text-embedding-3-small")` —
   the one non-Claude model call in the whole app; `OPENAI_API_KEY`
-  required. `chroma_db/` persist path (gitignored); `CHROMA_PATH` /
-  `HABIT_MEMORY_COLLECTION` env overrides.
-- `src/summarize_memory.py` — **Phase 4**. `summarize_user_week(user_id,
+  required. `HABIT_MEMORY_COLLECTION` env override (default
+  `habit_summaries`).
+- `src/summarize_memory.py` — **Phase 4**, unchanged in Phase 5.
+  `summarize_user_week(user_id,
   *, today=None)` — importable (not just a script; `scheduler.py` calls
   it directly). Fetches the trailing 7 days of `HabitLog` rows → per-habit
   digest → `ChatAnthropic("claude-sonnet-5")` writes a 3-5 sentence
@@ -183,10 +254,10 @@
     `retrieval_context` field here is ground truth for what *should* be
     retrievable — it feeds the mock in `test_rag_agent.py`, it is never
     passed directly into a real `LLMTestCase`.
-  - `evaluation/conftest.py` — minimal. Carries no Chroma-seeding logic
-    (removed — dead code once retrieval is mocked, since nothing ever
-    reaches a real Chroma collection). Holds only fixtures the mocked
-    suite actually needs, e.g. loading the golden dataset JSON.
+  - `evaluation/conftest.py` — minimal. Carries no vector-store-seeding
+    logic (dead code once retrieval is mocked — nothing ever reaches a
+    real collection). Holds only fixtures the mocked suite actually needs,
+    e.g. loading the golden dataset JSON.
   - `evaluation/test_rag_agent.py` — loads the golden dataset,
     `@pytest.mark.parametrize` loops through it. Cases are `async def`
     (they `await` the agent); `pytest.ini`'s `asyncio_mode = auto` runs
@@ -202,12 +273,12 @@
     - `autouse` fixture `mock_vector_search` swaps
       `src.tools.get_habit_memory_store` for a fake whose
       `.vectorstore.similarity_search` returns `Document`s built from that
-      case's golden `retrieval_context`. (The plan called for patching
-      `VectorStore.similarity_search` directly, but `Chroma` overrides
-      that method so patching the abstract base is inert — the fake-store
-      swap is the working equivalent, still provider-agnostic and
-      unchanged by the Phase 5 pgvector swap.) Tests the agent's reasoning
-      over retrieved context, not the real retrieval pipeline.
+      case's golden `retrieval_context`. (Patching
+      `VectorStore.similarity_search` on the abstract base is inert
+      because the concrete store overrides it — the fake-store swap is the
+      working equivalent, provider-agnostic, and needed zero changes when
+      Phase 5 swapped Chroma → pgvector.) Tests the agent's reasoning over
+      retrieved context, not the real retrieval pipeline.
     - Invokes the real agent directly (`build_agent()` from
       `src/agent.py`, bypassing FastAPI/JWT).
     - After invoking, inspects the agent's final message history for a
@@ -221,36 +292,67 @@
       `ContextualPrecisionMetric` (both passed `model=get_judge_model()`,
       or they default to OpenAI) and `CoachingEmpathyMetric()`; collects
       per-metric failures with score + reason. All 6 cases currently pass.
-  - **Deferred to Phase 5**: a real (non-mocked) integration test of the
-    vector store pipeline is written once, after the pgvector migration,
-    against whichever database is final — not built now against Chroma,
-    since it would just be rewritten.
+  - **Still deferred (carry to Phase 6)**: a real (non-mocked) integration
+    test of the vector store pipeline against Neon/pgvector. The migration
+    landed but this test wasn't built; the eval suite still mocks
+    retrieval entirely.
+- `Dockerfile` — **Phase 5**. `python:3.13-slim` + `uv`; two-layer cache
+  (deps from `pyproject.toml`/`uv.lock` first, then `src/`);
+  `CMD ["uv", "run", "python", "-m", "src.main"]` (run as a module —
+  `python src/main.py` fails on the relative imports). This is the image
+  Railway builds.
+- `.dockerignore` — **Phase 5**. Keeps `.env`, `.venv/`, `evaluation/`,
+  local DB files, `deploy/` etc. out of the build context.
+- `requirements.txt` — **Phase 5**. Streamlit Cloud's dependency file —
+  `streamlit`, `plotly`, `requests` ONLY. Do NOT add the backend stack;
+  the frontend imports nothing else.
 - `run.sh` — starts backend + frontend together; port-based cleanup trap.
 
 # Architecture Notes
+- **Deployed:** FastAPI backend on **Railway** (Docker, rebuilds on push
+  to `main`); one **Neon** Postgres database; Streamlit frontend headed
+  for **Streamlit Cloud** (not yet deployed). Telegram reaches the backend
+  by webhook. No AWS, no GCP, no `supervisord`, no CI pipeline.
+- **One Neon database, three concerns:** the relational tables
+  (`users`/`habits`/`habit_logs`), the LangGraph checkpoint tables
+  (`checkpoints*`), and pgvector (`langchain_pg_*`, collection
+  `habit_summaries`). The app + vector store use Neon's POOLED endpoint;
+  the checkpointer uses the DIRECT endpoint.
 - **Identity is real JWT-based auth.** `user_id` = numeric `User.id`,
   resolved server-side from a verified token, never client input.
-  Doubles as LangGraph `thread_id`.
+  Doubles as LangGraph `thread_id`. Telegram messages resolve to the one
+  `HABIT_TRACKER_USERNAME` account server-side (no JWT on that path).
 - **Habits are scoped per user** (`Habit.user_id` FK) — enforced
   server-side everywhere.
-- **`habit_memory` (Chroma, via `vector_store.HabitMemoryStore`) is
+- **`habit_summaries` (pgvector, via `vector_store.HabitMemoryStore`) is
   scoped per user the same way** — tagged on write, `filter={"user_id":
   …}` on read, both via the resolved `user_id`, never a global unscoped
   collection. Embedded with OpenAI `text-embedding-3-small`.
 
 # Workflows
 - Install: `uv add <dependency>`
-- Run everything: `./run.sh`
+- Local dev: leave `DATABASE_URL` unset → SQLite + `AsyncSqliteSaver`
+  fallback, no Postgres needed. Set `DATABASE_URL` (+ `DATABASE_URL_DIRECT`)
+  to point local runs at Neon.
+- Run everything: `./run.sh` (backend `:8000`, Streamlit `:8501`)
 - Backend only: `uv run uvicorn src.main:app --reload`
 - Frontend only: `uv run streamlit run src/app.py`
-- Bot only (testing): `uv run python -m src.bot`
 - MCP server only (learning/testing): `uv run python -m src.mcp_server`
+- Telegram (local): `src/bot.py` is no longer standalone. Run the backend
+  behind a tunnel (`cloudflared tunnel --url http://localhost:8000`) and
+  set `TELEGRAM_WEBHOOK_URL` to `https://<tunnel>/webhook/telegram`.
 - Trigger a nudge manually: `POST /evaluate_friction` while logged in
 - Generate this week's memory summary now: `uv run python -m src.summarize_memory`
 - Run the evaluation suite: `uv run pytest evaluation/` — real Anthropic +
   OpenAI-embedding calls; ~1 agent + 3 opus-5 judge calls per golden case,
-  ~3.5 min for the 6 cases. Needs `ANTHROPIC_API_KEY` + `OPENAI_API_KEY`.
-- Inspect DB (read-only): `sqlite3 -readonly -header -column habits.db "SELECT * FROM habits;"`
+  ~3.5 min for the 6 cases. Needs `ANTHROPIC_API_KEY` + `OPENAI_API_KEY`
+  (does NOT need `DATABASE_URL` — it mocks retrieval and uses a throwaway
+  SQLite).
+- Deploy the backend: `git push origin main` → Railway rebuilds the
+  `Dockerfile` and redeploys. Env is set via `railway variables` /
+  dashboard, not committed.
+- Inspect the DB (read-only): `psql "$DATABASE_URL" -c "select * from habits;"`
+  (or the SQLite equivalent locally).
 
 # Rules
 - `create_agent` from `langchain.agents` only, never
@@ -259,7 +361,21 @@
 - `.env`: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` (embeddings only — see
   below), `JWT_SECRET_KEY` (app-generated via `secrets.token_hex(32)`),
   `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `HABIT_TRACKER_USERNAME`/
-  `PASSWORD` — all user-managed except `JWT_SECRET_KEY`.
+  `PASSWORD` (`PASSWORD` is now only the Streamlit login — the bot no
+  longer logs in), plus **Phase 5**: `DATABASE_URL` (Neon POOLED
+  endpoint), `DATABASE_URL_DIRECT` (Neon un-pooled — for the
+  checkpointer), `TELEGRAM_WEBHOOK_URL` (public backend URL +
+  `/webhook/telegram`), `WEBHOOK_SECRET_TOKEN` (any random string).
+  Leave `DATABASE_URL` unset for a SQLite-backed local run. On Railway
+  these are set via `railway variables`, never committed.
+- **Checkpointer uses Neon's DIRECT endpoint; everything else uses the
+  POOLED endpoint.** `postgres_checkpointer()` runs server-side prepared
+  statements (`prepare_threshold=0`) that PgBouncer transaction pooling
+  rejects; the relational engine and `PGVector` set
+  `prepare_threshold=None` and work through the pooler.
+- **Telegram is a webhook (`POST /webhook/telegram`), driven from
+  `main.py`'s lifespan.** Never re-add `run_polling` / a standalone
+  `bot.py` process — polling can't run on Railway/serverless hosting.
 - Provider split (deliberate): every model that GENERATES or JUDGES text
   is Claude — the agent and weekly summariser on `claude-sonnet-5`, the
   DeepEval judge on `claude-opus-5`. `OPENAI_API_KEY` is used for exactly
@@ -268,11 +384,10 @@
   dependency. Do not route any generation or judging through OpenAI.
 - Tools derive the acting user only from `runtime` (ToolRuntime), never
   an LLM-supplied argument.
-- `app.py` and `bot.py`: no LangChain/LangGraph/DB logic, HTTP only.
-  `scheduler.py` and `mcp_server.py` are trusted in-process/fixed-identity
-  exceptions.
-- `bot.py` refreshes its JWT proactively (~23h); 401-retry is a fallback
-  only.
+- `app.py`: no LangChain/LangGraph/DB logic, HTTP only. `bot.py`: no
+  LangChain/LangGraph/DB imports either — it takes an `on_message`
+  callback from `main.py` and does Telegram I/O only. `scheduler.py` and
+  `mcp_server.py` are trusted in-process/fixed-identity exceptions.
 - `scheduler.py`'s two jobs (daily nudge, weekly summary) share ONE
   `AsyncIOScheduler` instance — never a second one. Shares the same
   `lifespan` in `main.py` as the agent.
@@ -292,23 +407,23 @@
   `vector_store.py`. This is the ONLY OpenAI call in the app — never add
   another, and never route generation/judging through OpenAI.
 - All vector-store access goes through `HabitMemoryStore` in
-  `vector_store.py` — the single file to rewrite for the Phase 5 pgvector
-  swap.
+  `vector_store.py` — the single file the pgvector migration touched, and
+  still the only place to change the vector backend.
 - `query_past_behavior` must call the generic `VectorStore.similarity_search`
   interface (`store.vectorstore.similarity_search(...)`), never a
-  Chroma-specific API — required for both test mocking and the Phase 5
-  pgvector swap.
+  backend-specific API — this is why the Chroma → pgvector migration
+  needed zero changes to the tool or the eval suite. Keep it that way.
 - `evaluation/` may import from `src/`; `src/` never imports from
   `evaluation/`.
 - Golden dataset tests swap `get_habit_memory_store` for a fake whose
   `.vectorstore.similarity_search` returns the golden `retrieval_context`
-  as `Document`s — no real Chroma collection is ever seeded (intentional
-  migration-proofing). `conftest.py` carries no Chroma-seeding logic —
-  don't re-add it "just in case."
+  as `Document`s — no real vector collection is ever seeded (intentional
+  migration-proofing — it survived the pgvector swap untouched).
+  `conftest.py` carries no seeding logic — don't re-add it "just in case."
 - Every parametrized evaluation test case uses a **unique per-case id**
   (`str(uuid.uuid4().int % 10**12)`) as its `thread_id` — never a fixed
-  or shared one (leaks conversation state between cases via
-  `AsyncSqliteSaver`). Integer form because the tools do `int(thread_id)`.
+  or shared one (leaks conversation state between cases via the
+  checkpointer). Integer form because the tools do `int(thread_id)`.
 - `LLMTestCase.retrieval_context` is always the actual `ToolMessage`
   content extracted post-invocation, never the golden dataset's
   `retrieval_context` field directly — that field only seeds the mock's
@@ -317,12 +432,13 @@
   flakiness. No `seed` parameter is set — Anthropic's API has no
   equivalent to OpenAI's `seed`, so don't add one under the assumption
   it will work.
-- A real (non-mocked) integration test of the vector store pipeline is
-  deferred to Phase 5, written once against the final pgvector setup —
-  not built now against Chroma.
-- No circular imports (`main → agent → tools → database`, `auth` is a leaf).
-- Never delete/overwrite real `habits.db`/`checkpoints.db` for testing —
-  use an isolated throwaway DB. Read-only inspection is fine.
+- A real (non-mocked) integration test of the vector store pipeline
+  against Neon/pgvector is still unbuilt — carry it to Phase 6.
+- No circular imports (`main → agent → tools → database`; `main → bot`
+  with no cycle back; `auth` is a leaf).
+- Never run tests against the real Neon database or a real
+  `habits.db`/`checkpoints.db` — use an isolated throwaway DB (the eval
+  suite already does). Read-only inspection is fine.
 - Kill whatever's on the port before restarting (`lsof -ti:8000`,
   `-ti:8501`) — don't touch unrelated processes.
 - Single-user scope throughout: one account, one `TELEGRAM_CHAT_ID` — no
@@ -335,20 +451,31 @@
   `"except <Weekday>"` — anything more complex stores fine but falls
   back to daily-style behavior everywhere (dashboard, stats, patterns).
 - `frequency`/`status` are unvalidated free text end-to-end.
-- JWT has no refresh flow (Streamlit: re-login on expiry). `bot.py`
-  compensates with proactive refresh.
+- JWT has no refresh flow — Streamlit re-logs in on expiry. (Nothing
+  compensates any more; the bot no longer holds a JWT.)
 - `mcp_server.py` is a separate learning exercise, not integrated —
   tools/data there don't reflect any additional safeguards beyond what's
   listed above.
 - The evaluation suite tests agent reasoning over mocked retrieval, not
-  the real vector store pipeline — see the Phase 5 deferred integration
-  test note above.
-- `deepeval` / `pytest` / `pytest-asyncio` sit in `[project.dependencies]`
-  (per the Phase 4 spec), so they ship with a plain `uv sync` — a lean
-  production image would move them to a group in Phase 5's containerize
-  step. `openai` rides in as `langchain-openai`'s and `deepeval`'s dep.
+  the real vector store pipeline — a real Neon/pgvector integration test
+  is still unbuilt (Phase 6).
+- `deepeval` / `pytest` / `pytest-asyncio` are still in
+  `[project.dependencies]`, so `uv sync --no-dev` in the `Dockerfile`
+  doesn't drop them — the Railway image carries them (harmless bloat).
+  Moving them to a dev group is a Phase 6 cleanup.
 - No LangSmith/observability tracing yet — planned for Phase 6 alongside
   a security layer, not currently configured anywhere.
-- No containerization or CI/CD yet — planned for Phase 5, after the
-  database migration in that same phase.
+- **Deployment gaps:** the Streamlit frontend is prepared for Streamlit
+  Cloud but not actually deployed. `src/bot.py` is no longer runnable on
+  its own (`python -m src.bot` is a no-op) — local Telegram testing needs
+  a tunnel + `TELEGRAM_WEBHOOK_URL`. The `deploy/launchd/` scripts still
+  target the old always-on-Mac model and their `bot` service now runs
+  dead code — superseded by Railway. There is no `docker compose` for a
+  local Postgres; local dev uses the SQLite fallback or points at Neon.
+- Neon free tier suspends the compute after ~5 min idle — the first
+  request after idle pays a ~0.5s reconnect (the pool's `check` handles
+  the stale connection).
+- Backend is public on Railway with **open signup** (`/auth/signup`) —
+  anyone with the URL can create an account and spend the Anthropic
+  budget. Gating it is a Phase 6 security item.
 

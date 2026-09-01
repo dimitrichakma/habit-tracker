@@ -46,33 +46,40 @@ without ever guessing at data it hasn't actually looked up.
 ## Architecture
 
 ```
-Streamlit frontend  --HTTP-->  FastAPI backend  -->  LangGraph agent  -->  Claude
-                                     |                      |
-                                SQLite (users,          SQLite (per-thread
-                                habits, logs)          conversation memory)
-                                     |                      |
-                                     |              ChromaDB (weekly behavioral
-                                     |              summaries, vector search)
-                                     |
-                              Telegram bot + APScheduler
-                              (daily reminder, friction check, weekly summary)
+Streamlit Cloud            Telegram  --webhook-->  ┌──────────────────────────┐
+(frontend)  --HTTP------------------------------>  │  FastAPI backend (Railway)│
+                                                  │  LangGraph agent -> Claude │
+                                                  │  APScheduler (2 cron jobs) │
+                                                  └────────────┬─────────────┘
+                                                               │
+                                            ┌──────────────────┴──────────────────┐
+                                            │        Neon PostgreSQL              │
+                                            │  users / habits / habit_logs        │
+                                            │  checkpoints* (conversation memory)  │
+                                            │  pgvector (weekly summary vectors)   │
+                                            └─────────────────────────────────────┘
 ```
 
-- **FastAPI** - REST API: auth, dashboard/stats endpoints, chat endpoint.
+- **FastAPI** (on Railway, from a `Dockerfile`) - REST API plus the Telegram
+  webhook (`/webhook/telegram`) and a `/healthz` probe. Rebuilds on every
+  push to `main`.
 - **LangGraph** (`langchain.agents.create_agent`) - the coaching agent, with
   a dynamic system prompt (recomputed on every call, so the model always
   knows the real current time) and a fixed set of tools.
-- **SQLAlchemy + SQLite** - users, habits, and daily logs. A second SQLite
-  database, managed by LangGraph's `AsyncSqliteSaver`, holds per-user
-  conversation memory so the coach remembers context across sessions.
-- **ChromaDB** - a local vector store of weekly behavioral summaries, wrapped
-  behind a single module so it can be swapped for pgvector later. Claude
-  writes the summaries; OpenAI's `text-embedding-3-small` embeds them (the
-  only non-Claude model call in the app).
+- **SQLAlchemy + Neon PostgreSQL** - one database holds three things: the
+  relational tables (users, habits, logs), LangGraph's per-thread
+  conversation memory (`AsyncPostgresSaver`), and the vector store. Local
+  dev falls back to SQLite when `DATABASE_URL` is unset.
+- **pgvector** - weekly behavioral summaries as searchable vectors, wrapped
+  behind a single module (`vector_store.py`). Claude writes the summaries;
+  OpenAI's `text-embedding-3-small` embeds them (the only non-Claude model
+  call in the app). Migrated from ChromaDB in Phase 5 without touching the
+  agent or the tests.
 - **Streamlit** - chat UI, Today's Dashboard, and Plotly progress charts.
-- **python-telegram-bot + APScheduler** - one scheduler, two jobs: the daily
-  8pm reminder / friction check and the Sunday-night weekly summary. Runs a
-  separate process from the API for Telegram.
+  HTTP-only; reads its backend URL from `BACKEND_BASE_URL`.
+- **python-telegram-bot + APScheduler** - the bot runs *inside* the backend
+  process now (a webhook, not a polling process). One scheduler, two jobs:
+  the daily 8pm reminder / friction check and the Sunday-night weekly summary.
 - **DeepEval + pytest** - the evaluation suite, judged entirely by Claude.
 
 ## Key design decisions
@@ -136,14 +143,16 @@ LLM-as-a-Judge scores carry run-to-run variance; treat the ranges above as
 indicative, not exact.
 
 Retrieval is mocked (a fake vector store returns each scenario's golden
-context), so the suite tests the agent's *reasoning over context* and stays
-unchanged through a future ChromaDB → pgvector migration.
+context), so the suite tests the agent's *reasoning over context* — which
+is why the Phase 5 ChromaDB → pgvector migration didn't touch it at all.
 
 ## Tech stack
 
-Python, FastAPI, LangChain / LangGraph, Anthropic Claude, SQLAlchemy, SQLite,
-ChromaDB, OpenAI embeddings, Streamlit, Plotly, python-telegram-bot,
-APScheduler, JWT (PyJWT), bcrypt, MCP, DeepEval, pytest.
+Python, FastAPI, LangChain / LangGraph, Anthropic Claude, SQLAlchemy,
+PostgreSQL (Neon) + pgvector, OpenAI embeddings, Streamlit, Plotly,
+python-telegram-bot (webhook), APScheduler, JWT (PyJWT), bcrypt, MCP,
+DeepEval, pytest. Deployed on Railway (backend) + Streamlit Cloud
+(frontend); containerized with a `Dockerfile`.
 
 ## Running it locally
 
@@ -153,8 +162,13 @@ APScheduler, JWT (PyJWT), bcrypt, MCP, DeepEval, pytest.
 - [uv](https://docs.astral.sh/uv/) — `curl -LsSf https://astral.sh/uv/install.sh | sh`
 - An [Anthropic API key](https://console.anthropic.com/) and an
   [OpenAI API key](https://platform.openai.com/api-keys)
+- Optional: a PostgreSQL database with the `pgvector` extension (e.g.
+  [Neon](https://neon.tech)). Leave `DATABASE_URL` unset to run on a local
+  SQLite file instead — everything works, you just don't get the vector
+  memory (it needs pgvector).
 - Optional (for the Telegram features): a bot token from
-  [@BotFather](https://t.me/BotFather)
+  [@BotFather](https://t.me/BotFather), plus a public HTTPS URL for the
+  webhook — locally, a tunnel like `cloudflared tunnel --url http://localhost:8000`.
 
 ### Install
 
@@ -191,17 +205,18 @@ automatically.
 ```bash
 uv run uvicorn src.main:app --reload      # backend only  (API docs at /docs)
 uv run streamlit run src/app.py           # frontend only
-uv run python -m src.bot                  # Telegram bot   (needs the backend running)
 uv run python -m src.summarize_memory     # write this week's memory summary now
 uv run python -m src.mcp_server           # standalone MCP server (stdio)
 ```
 
-Only one process may poll the Telegram token at a time — don't run two bots.
+The Telegram bot runs inside the backend as a webhook — there's no separate
+bot process. For local Telegram testing, expose the backend over a tunnel
+and point the webhook at it:
 
-**Always-on (macOS)** — `deploy/launchd/manage.sh install` registers the
-backend + bot as `launchd` agents (auto-start at login, restart on crash);
-`manage.sh {status,logs,restart,stop,uninstall}` manage them. Run
-`manage.sh stop` before `./run.sh` so nothing fights over port 8000.
+```bash
+cloudflared tunnel --url http://localhost:8000
+# then set TELEGRAM_WEBHOOK_URL=https://<tunnel-host>/webhook/telegram in .env
+```
 
 ### Evaluation suite
 
@@ -216,6 +231,21 @@ See [Evaluation](#evaluation) above for what it grades. Makes real API calls
 See `CLAUDE.md` for the full architecture reference and `docs/` for detailed
 walkthroughs of specific pieces of logic.
 
+## Deployment
+
+The backend is containerized (`Dockerfile`) and runs on **Railway**, which
+rebuilds and redeploys on every push to `main`. It talks to a **Neon**
+PostgreSQL database (one database for the relational tables, the conversation
+checkpoints, and the pgvector store). Environment variables are set through
+Railway, not committed.
+
+The Streamlit frontend is prepared for **Streamlit Cloud** — it reads
+`BACKEND_BASE_URL` from app secrets and has its own slim `requirements.txt`.
+
+Telegram delivers updates to `POST /webhook/telegram`; the backend registers
+the webhook on startup from `TELEGRAM_WEBHOOK_URL` and verifies every request
+against `WEBHOOK_SECRET_TOKEN`.
+
 ## Status
 
 Actively developed.
@@ -224,4 +254,5 @@ Actively developed.
 - **Phase 2** — Telegram bot + daily 8pm reminder scheduler ✅
 - **Phase 3** — pattern-aware coaching, micro-commitments, standalone MCP server ✅
 - **Phase 4** — semantic memory (RAG) over weekly summaries + LLM-as-a-Judge evaluation suite ✅
-- **Phase 5** — Postgres + pgvector migration, then Docker packaging and CI/CD (planned)
+- **Phase 5** — SQLite → Neon Postgres + pgvector, Telegram polling → webhook, Docker packaging, deployed on Railway ✅
+- **Phase 6** — observability + a security layer (request tracing, gating open signup); a real non-mocked pgvector integration test (planned)
