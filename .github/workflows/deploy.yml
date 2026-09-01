@@ -10,7 +10,6 @@ env:
   REGION: us-central1
   REPO_NAME: habit-tracker-repo
   SERVICE_NAME: habit-tracker-api
-  # UPDATE THIS LINE WITH YOUR ACTUAL GCP PROJECT ID
   PROJECT_ID: project-ad6ebf83-4f61-493b-b96
 
 jobs:
@@ -31,14 +30,9 @@ jobs:
 
       - name: Run tests
         env:
-          # Real keys needed for your AI evaluation suite
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          
-          # Real bot token if your tests mock Telegram API calls
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          
-          # Dummy values just to prevent startup crashes
           TELEGRAM_WEBHOOK_URL: "https://dummy-test-url.com/webhook"
           WEBHOOK_SECRET_TOKEN: "dummy_test_secret"
           JWT_SECRET_KEY: "dummy_jwt_secret"
@@ -58,19 +52,11 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Authenticate to Google Cloud (via service account)
-        if: ${{ secrets.GCP_SERVICE_ACCOUNT_EMAIL != '' || secrets.GCP_SERVICE_ACCOUNT != '' }}
+      - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: '${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}'
-          service_account: '${{ secrets.GCP_SERVICE_ACCOUNT_EMAIL || secrets.GCP_SERVICE_ACCOUNT }}'
-          project_id: '${{ env.PROJECT_ID }}'
-
-      - name: Authenticate to Google Cloud (direct workload identity)
-        if: ${{ secrets.GCP_SERVICE_ACCOUNT_EMAIL == '' && secrets.GCP_SERVICE_ACCOUNT == '' }}
-        uses: google-github-actions/auth@v2
-        with:
-          workload_identity_provider: '${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}'
+          service_account: '${{ secrets.GCP_SERVICE_ACCOUNT_EMAIL }}'
           project_id: '${{ env.PROJECT_ID }}'
 
       - name: Set up Cloud SDK
@@ -89,7 +75,7 @@ jobs:
       - name: Deploy to Cloud Run
         run: |
           gcloud run deploy ${{ env.SERVICE_NAME }} \
-            --image ${{ env.IMAGE_URL }} \
+            --image "$IMAGE_URL" \
             --region ${{ env.REGION }} \
             --allow-unauthenticated \
             --set-env-vars="DATABASE_URL=${{ secrets.DATABASE_URL }},TELEGRAM_WEBHOOK_URL=${{ secrets.TELEGRAM_WEBHOOK_URL }},WEBHOOK_SECRET_TOKEN=${{ secrets.WEBHOOK_SECRET_TOKEN }},WEB_DASHBOARD_SECRET=${{ secrets.WEB_DASHBOARD_SECRET }},OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }},ANTHROPIC_API_KEY=${{ secrets.ANTHROPIC_API_KEY }},JWT_SECRET_KEY=${{ secrets.JWT_SECRET_KEY }},TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }},TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}"
