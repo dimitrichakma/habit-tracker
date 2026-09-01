@@ -58,10 +58,20 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Authenticate to Google Cloud
+      - name: Authenticate to Google Cloud (via service account)
+        if: ${{ secrets.GCP_SERVICE_ACCOUNT_EMAIL != '' || secrets.GCP_SERVICE_ACCOUNT != '' }}
         uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: '${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}'
+          service_account: '${{ secrets.GCP_SERVICE_ACCOUNT_EMAIL || secrets.GCP_SERVICE_ACCOUNT }}'
+          project_id: '${{ env.PROJECT_ID }}'
+
+      - name: Authenticate to Google Cloud (direct workload identity)
+        if: ${{ secrets.GCP_SERVICE_ACCOUNT_EMAIL == '' && secrets.GCP_SERVICE_ACCOUNT == '' }}
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: '${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}'
+          project_id: '${{ env.PROJECT_ID }}'
 
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@v2
