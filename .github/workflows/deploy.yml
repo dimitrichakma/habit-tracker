@@ -42,7 +42,7 @@ jobs:
           TELEGRAM_WEBHOOK_URL: "https://dummy-test-url.com/webhook"
           WEBHOOK_SECRET_TOKEN: "dummy_test_secret"
           JWT_SECRET_KEY: "dummy_jwt_secret"
-          DATABASE_URL: sqlite:///:memory:
+          DATABASE_URL: "sqlite:///:memory:"
         run: uv run pytest evaluation/
 
   deploy:
