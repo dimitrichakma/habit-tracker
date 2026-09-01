@@ -1,0 +1,7 @@
+# Streamlit Community Cloud deploys src/app.py from this file.
+# The frontend is HTTP-only (talks to the backend via BACKEND_BASE_URL) and
+# imports nothing else — do NOT add the backend stack (langchain, langgraph,
+# psycopg, deepeval, …); those live in pyproject.toml for the backend image.
+streamlit>=1.62.0
+plotly>=7.0.0
+requests>=2.32.0

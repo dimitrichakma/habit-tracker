@@ -1,5 +1,6 @@
 """Streamlit chat frontend for the Habit Tracker. HTTP calls only — no agent logic here."""
 
+import os
 import re
 
 import plotly.graph_objects as go
@@ -29,7 +30,9 @@ PASSWORD_REQUIREMENTS = [
     ("One special character (e.g. ! @ # $ %)", lambda p: re.search(r"[^A-Za-z0-9]", p) is not None),
 ]
 
-BACKEND_BASE_URL = "http://localhost:8000"
+# Deployed frontend (Streamlit Cloud) sets BACKEND_BASE_URL to the public
+# backend URL via app secrets; local dev falls back to the dev server.
+BACKEND_BASE_URL = os.environ.get("BACKEND_BASE_URL", "http://localhost:8000").rstrip("/")
 SIGNUP_URL = f"{BACKEND_BASE_URL}/auth/signup"
 LOGIN_URL = f"{BACKEND_BASE_URL}/auth/login"
 CHAT_URL = f"{BACKEND_BASE_URL}/chat"
