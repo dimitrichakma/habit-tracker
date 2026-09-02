@@ -42,6 +42,17 @@ without ever guessing at data it hasn't actually looked up.
   scenarios, graded by a stronger Claude model against a custom empathy
   metric plus faithfulness and context-precision, proving the agent
   acknowledges failure without shaming and always offers an actionable step.
+- **Safety in two layers.** In the agent: an input classifier (Claude
+  Haiku, behind a regex pre-filter) that intercepts prompt injection,
+  off-topic requests, and genuinely harmful ones (self-harm, disordered
+  eating framed as a "habit") before the coach model runs, plus an output
+  check for leaked internals. In front of it: a gateway with per-user rate
+  limits, a message size cap, regex PII masking, a daily token budget, and
+  a hard timeout — every check fails safe.
+- **Request tracing.** Every conversation is traced to LangSmith with tags
+  and a correlation id that also threads through the logs, so a single
+  Telegram message can be followed end to end. Tracing is out-of-band — a
+  LangSmith outage never touches a user request.
 
 ## Architecture
 
@@ -61,8 +72,8 @@ Streamlit Cloud            Telegram  --webhook-->  ┌────────�
 ```
 
 - **FastAPI** (on Railway, from a `Dockerfile`) - REST API plus the Telegram
-  webhook (`/webhook/telegram`) and a `/healthz` probe. Rebuilds on every
-  push to `main`.
+  webhook (`/webhook/telegram`) and a `/healthz` probe. Deployed with
+  `railway up` from the CLI.
 - **LangGraph** (`langchain.agents.create_agent`) - the coaching agent, with
   a dynamic system prompt (recomputed on every call, so the model always
   knows the real current time) and a fixed set of tools.
@@ -80,7 +91,9 @@ Streamlit Cloud            Telegram  --webhook-->  ┌────────�
 - **python-telegram-bot + APScheduler** - the bot runs *inside* the backend
   process now (a webhook, not a polling process). One scheduler, two jobs:
   the daily 8pm reminder / friction check and the Sunday-night weekly summary.
-- **DeepEval + pytest** - the evaluation suite, judged entirely by Claude.
+- **DeepEval + pytest** - the evaluation suite, judged entirely by Claude,
+  plus a guardrail suite and a real (containerised) pgvector integration test.
+- **LangSmith** - request tracing for both agent paths, enabled by env only.
 
 ## Key design decisions
 
@@ -111,6 +124,16 @@ Streamlit Cloud            Telegram  --webhook-->  ┌────────�
   LLM-as-a-Judge suite grades each release: retrieval is mocked so the tests
   survive a future vector-store swap unchanged, and the judge is a stronger
   Claude tier than the agent it grades to reduce self-grading bias.
+- **Safety is layered and fails safe.** The guardrails are `create_agent`
+  middleware, not a bespoke graph, so they don't fight the checkpointer; a
+  deterministic regex pre-filter runs before any classifier call; and on a
+  classifier error the request is *blocked*, never let through. The gateway
+  sits outside the agent entirely — a message that's too long, or over the
+  token budget, never reaches a model.
+- **Classification is Claude too.** The guardrail classifier is Claude Haiku,
+  not a cheaper non-Claude model — the "every model that generates, judges,
+  or classifies text is Claude" rule holds, including in fallback paths.
+  OpenAI is still only ever the embedding maths.
 
 ## Evaluation
 
@@ -151,7 +174,8 @@ is why the Phase 5 ChromaDB → pgvector migration didn't touch it at all.
 Python, FastAPI, LangChain / LangGraph, Anthropic Claude, SQLAlchemy,
 PostgreSQL (Neon) + pgvector, OpenAI embeddings, Streamlit, Plotly,
 python-telegram-bot (webhook), APScheduler, JWT (PyJWT), bcrypt, MCP,
-DeepEval, pytest. Deployed on Railway (backend) + Streamlit Cloud
+LangSmith (tracing), slowapi (rate limiting), DeepEval, pytest,
+testcontainers. Deployed on Railway (backend) + Streamlit Cloud
 (frontend); containerized with a `Dockerfile`.
 
 ## Running it locally
@@ -218,26 +242,32 @@ cloudflared tunnel --url http://localhost:8000
 # then set TELEGRAM_WEBHOOK_URL=https://<tunnel-host>/webhook/telegram in .env
 ```
 
-### Evaluation suite
+### Test suites
 
 ```bash
-uv run pytest evaluation/
+uv run pytest evaluation/test_rag_agent.py        # LLM-as-a-Judge coaching eval (~3-4 min, real API calls)
+uv run pytest evaluation/test_guardrails.py       # safety guardrails, drives the real agent
+uv run pytest evaluation/test_gateway_security.py # rate limits / size cap / PII / budget / timeout (offline, fast)
+uv run pytest tests/                              # real pgvector integration (Docker or TEST_DATABASE_URL)
 ```
 
-See [Evaluation](#evaluation) above for what it grades. Makes real API calls
-(~3–4 min; a few dollars of Claude usage). Needs `ANTHROPIC_API_KEY` +
-`OPENAI_API_KEY`.
+See [Evaluation](#evaluation) above for what the coaching eval grades. The
+`evaluation/` suites need `ANTHROPIC_API_KEY` (+ `OPENAI_API_KEY`); `tests/`
+needs Docker or a scratch `TEST_DATABASE_URL` plus `OPENAI_API_KEY`, and
+skips cleanly otherwise.
 
 See `CLAUDE.md` for the full architecture reference and `docs/` for detailed
 walkthroughs of specific pieces of logic.
 
 ## Deployment
 
-The backend is containerized (`Dockerfile`) and runs on **Railway**, which
-rebuilds and redeploys on every push to `main`. It talks to a **Neon**
-PostgreSQL database (one database for the relational tables, the conversation
-checkpoints, and the pgvector store). Environment variables are set through
-Railway, not committed.
+The backend is containerized (`Dockerfile`) and runs on **Railway**. Deploys
+are `railway up` from the CLI (the service isn't wired to GitHub auto-deploy).
+It talks to a **Neon** PostgreSQL database (one database for the relational
+tables, the conversation checkpoints, and the pgvector store). Environment
+variables are set through Railway, not committed — see `.env.example` for the
+full list, including the optional Phase 6 tracing / rate-limit / guardrail /
+budget knobs.
 
 The Streamlit frontend is prepared for **Streamlit Cloud** — it reads
 `BACKEND_BASE_URL` from app secrets and has its own slim `requirements.txt`.
@@ -248,11 +278,11 @@ against `WEBHOOK_SECRET_TOKEN`.
 
 ## Status
 
-Actively developed.
+Feature-complete through Phase 6.
 
 - **Phase 1** — core chat, Today's Dashboard, JWT auth, Plotly progress charts ✅
 - **Phase 2** — Telegram bot + daily 8pm reminder scheduler ✅
 - **Phase 3** — pattern-aware coaching, micro-commitments, standalone MCP server ✅
 - **Phase 4** — semantic memory (RAG) over weekly summaries + LLM-as-a-Judge evaluation suite ✅
 - **Phase 5** — SQLite → Neon Postgres + pgvector, Telegram polling → webhook, Docker packaging, deployed on Railway ✅
-- **Phase 6** — observability + a security layer (request tracing, gating open signup); a real non-mocked pgvector integration test (planned)
+- **Phase 6** — LangSmith tracing + correlation ids, security layer (signup gate, rate limiting, headers), prompt-caching latency work, a real non-mocked pgvector integration test, AI guardrails (input/output safety classification), and an infrastructure gateway (size cap, PII masking, token budget, timeout, generic errors) ✅

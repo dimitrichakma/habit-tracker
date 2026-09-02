@@ -32,14 +32,44 @@
     `python-telegram-bot` Application + handlers); `main.py`'s lifespan
     drives it and registers the webhook.
   - **Deployment:** the FastAPI backend is containerized (`Dockerfile`)
-    and runs on **Railway** (rebuilds on `git push` to `main`). The
-    Streamlit frontend is prepared for **Streamlit Cloud** (env-driven
-    `BACKEND_BASE_URL`, a slim `requirements.txt`) but the deploy step is
-    manual and not yet done. No `supervisord`, no GitHub Actions pipeline —
-    the two services deploy independently.
+    and runs on **Railway**. Deploys are **`railway up` from the CLI**
+    (uploads the build context) — NOT `git push`. This repo's Railway
+    service is not wired to GitHub auto-deploy; a `git push` alone does
+    nothing until `railway up` runs. The Streamlit frontend is prepared
+    for **Streamlit Cloud** (env-driven `BACKEND_BASE_URL`, a slim
+    `requirements.txt`) but the deploy step is manual and not yet done.
+    No `supervisord`, no GitHub Actions pipeline — the two services
+    deploy independently.
   - The original plan routed through AWS then GCP; both were abandoned
     (GCP's org policies made public Cloud Run unworkable). Railway is the
     final answer.
+- Phase 6 (complete): observability, safety, and infrastructure hardening.
+  - **6.1 Observability:** LangSmith tracing on both agent paths (`/chat`,
+    Telegram webhook) + `run_friction_nudge`, project `"habit-tracker"`.
+    `@traceable` on the non-graph helpers (`summarize_user_week`,
+    `HabitMemoryStore.add_summary` / `similarity_search`) with input
+    scrubbing. Per-request correlation ids on every log line. Tracing is
+    env-driven (`LANGSMITH_TRACING` etc.) and never fails a request.
+  - **Security layer:** open `/auth/signup` gated behind `SIGNUP_SECRET`
+    (an `X-Signup-Secret` header); in-memory rate limiting (slowapi) +
+    baseline security headers.
+  - **pgvector integration test:** a real, non-mocked `tests/` suite
+    exercising `vector_store.HabitMemoryStore` write / read / per-user
+    isolation against a real Postgres+pgvector (testcontainers or
+    `TEST_DATABASE_URL`).
+  - **Latency:** Anthropic prompt caching on the static system-prompt
+    block, `pool_recycle` on the DB engine, Railway region co-located
+    with Neon (`us-east-2`). `SummarizationMiddleware` was tried and
+    **removed** — it fired twice per turn (+20-30s).
+  - **AI guardrails & semantic safety:** input classification (regex
+    pre-filter → Claude Haiku classifier) short-circuiting the agent on
+    `PromptInjection` / `HarmfulBehavior` / `OffTopic`, plus an
+    output guardrail (`after_model`) for leaked internals / medical
+    advice. Fail-safe (block, never open) on classifier error.
+  - **AI gateway & infrastructure security:** per-message size cap, regex
+    PII masking, a daily token budget (`token_usage` table), a generic
+    catch-all error handler, and a hard timeout on the agent call. See
+    `src/main.py`'s gateway section.
 
 # Tech Stack
 - Backend: FastAPI, LangGraph, LangChain (Anthropic), SQLAlchemy,
@@ -56,6 +86,11 @@
   fallback). Deploy: `Dockerfile` + `.dockerignore` + `requirements.txt`
   (Streamlit Cloud); Railway (backend), Neon (Postgres), Streamlit Cloud
   (frontend, pending).
+- Phase 6: `langsmith` (≥0.12.1, tracing — bumped from 0.11.1),
+  `slowapi` (in-memory rate limiting). The Haiku guardrail classifier
+  uses the existing `langchain-anthropic`. Dev group (`[dependency-groups]
+  dev`): `testcontainers[postgres]` for the `tests/` pgvector integration
+  suite. No new runtime NLP deps — PII masking is plain `re`.
 - Package manager: uv
 - `create_agent` lives in `langchain.agents`, not `langchain-anthropic`
 
@@ -72,8 +107,16 @@
     Neon's POOLED (PgBouncer / `-pooler`) endpoint.
   - `User(id, username, hashed_password)`; `Habit(id, user_id FK, name,
     frequency)`; `HabitLog(id, habit_id, date, status)`.
+  - `TokenUsage(id, user_id FK, usage_date, input_tokens, output_tokens)`
+    — **Phase 6**. One row per `(user_id, usage_date)` (unique), the
+    daily token-budget ledger. `daily_token_total(user_id, day)` sums it
+    (0 when no row — that IS the per-calendar-day reset);
+    `record_token_usage(...)` increments it (called post-reply from a
+    `BackgroundTask`). Only the worker model's `usage_metadata` is
+    counted — the Haiku guardrail classifier's tokens are not.
   - `frequency`/`status` are free text, not enums.
-  - `init_db()` additive/idempotent, never drops data. On Postgres it runs
+  - `init_db()` additive/idempotent, never drops data — `create_all`
+    picks up `token_usage` on the next startup. On Postgres it runs
     `CREATE EXTENSION IF NOT EXISTS vector` (for pgvector's tables). The
     nullable-column migration `_migrate_add_habits_user_id()` is
     **SQLite-only** (guarded on `engine.dialect.name`; `PRAGMA` isn't
@@ -109,7 +152,28 @@
     before assuming.
   - Dynamic system prompt via `@dynamic_prompt` middleware
     (`langchain.agents.middleware`) — NOT a callable to `system_prompt=`
-    (unsupported). Injects current date/time.
+    (unsupported). Returns two content blocks: the static ~90-line rules
+    block carries an Anthropic prompt-cache breakpoint
+    (`cache_control: ephemeral`, **Phase 6** latency work); the
+    per-second timestamp is a separate uncached block after it.
+  - **Phase 6 guardrails** (the "AI guardrails & semantic safety"
+    section): `input_guardrail` (`@before_model(can_jump_to=["end"])`)
+    and `output_guardrail` (`@after_model`). Input: a deterministic
+    `_INJECTION_PATTERNS` regex pre-filter runs first (a hit →
+    `PromptInjection`, classifier skipped), then a Claude Haiku
+    classifier (`CLASSIFIER_MODEL`, `.with_structured_output`) tags
+    `Safe` / `PromptInjection` / `HarmfulBehavior` / `OffTopic`. A
+    flagged turn jumps to end with a canned refusal (neutral for
+    injection, friendly redirect for off-topic, genuinely caring +
+    `HARM_SUPPORT_RESOURCE` for harmful behavior) — the worker model
+    never sees it. Output: `_LEAK_PATTERNS` / `_PRESCRIPTION_PATTERNS`
+    regex always run, then an optional Haiku semantic check
+    (`GUARDRAIL_OUTPUT_LLM_CHECK`); a flagged reply is swapped for
+    `_OUTPUT_FALLBACK` (kept `id` → `add_messages` upsert). **Fails safe**
+    — any classifier error/timeout (`GUARDRAIL_TIMEOUT_SECONDS`) blocks /
+    replaces, never opens. Blocked turns are tagged on the LangSmith run
+    (`guardrail_blocked`, `<category>`). `middleware=[input_guardrail,
+    habit_coach_prompt, output_guardrail]`.
   - Memory (**Phase 5**): `AsyncPostgresSaver`, keyed by `thread_id`.
     `build_agent(checkpointer=None)` is an `@asynccontextmanager`, one
     shared instance per server lifetime; `main.py`'s lifespan passes it
@@ -136,7 +200,13 @@
   `get_current_user_id` dependency. Leaf module, no import cycles. Reads
   `JWT_SECRET_KEY` at import time, fails fast if unset. Tokens expire in
   24h, no refresh flow.
+  - **Phase 6**: `require_signup_allowed` dependency — no-op when
+    `SIGNUP_SECRET` is unset (local dev, signup open); otherwise a signup
+    request must carry a matching `X-Signup-Secret` header
+    (`hmac.compare_digest`), else 403. `password_requirement_status` /
+    `is_strong_password` unchanged.
 - `src/main.py` — FastAPI app. The `lifespan` (Phase 5) does, in order:
+  `_configure_request_logging()` (Phase 6 — correlation-id log filter) →
   `init_db()` → open the Postgres checkpointer pool (if a Postgres
   `DATABASE_URL`/`DATABASE_URL_DIRECT` is set, else `None`) →
   `build_agent(checkpointer=…)` → `start_reminder_scheduler(agent)` →
@@ -145,9 +215,18 @@
   secret_token=WEBHOOK_SECRET_TOKEN)` (non-fatal — logs a warning if the
   URL is a placeholder). Teardown reverses it (`delete`/`stop`/`shutdown`,
   scheduler shutdown, pool close) via one `AsyncExitStack`.
-  - `POST /auth/signup`, `POST /auth/login` → JWT.
+  - `POST /auth/signup` — **Phase 6** gated by
+    `Depends(require_signup_allowed)` (`SIGNUP_SECRET`) + IP rate limit.
+    `POST /auth/login` — IP rate-limited (brute-force). Both → JWT.
   - `POST /chat` — `{message}` only, identity from JWT via
-    `Depends(get_current_user_id)`, never client-supplied.
+    `Depends(_rate_limit_user_id)` (wraps `get_current_user_id`, stashes
+    the id on `request.state` so the limiter keys on the user, not the
+    proxy IP), never client-supplied. **Phase 6 gateway checks before the
+    agent:** rate limit (per user_id) → size cap (`MAX_MESSAGE_CHARS`,
+    413) → `mask_pii` (fail-closed) → daily token budget
+    (`MAX_DAILY_QUOTA`, 429). Agent call is wrapped by `_invoke_agent`
+    (timeout → `AGENT_UNAVAILABLE_MESSAGE`); token usage recorded after
+    via `BackgroundTasks`.
   - `GET /habits/today`, `GET /habits/stats?days=N`, `GET /chat/history`
     — all auth-required, scoped to caller's `user_id`.
   - `POST /evaluate_friction` — **Phase 3**. Manual trigger for testing,
@@ -156,22 +235,55 @@
     `user_id` — this was the exact vulnerability already fixed once in
     `/chat`, never reintroduce it here. Runs the same
     pending-habits-then-agent-nudge flow the scheduler runs automatically.
-  - `POST /webhook/telegram` — **Phase 5**. Telegram POSTs updates here.
-    Checks `X-Telegram-Bot-Api-Secret-Token` == `WEBHOOK_SECRET_TOKEN`
-    (401 on mismatch/missing), parses the `Update`, calls
-    `telegram_app.process_update(update)`, returns 200.
+    Keeps only its IP rate limit — no size cap / masking / budget /
+    timeout (it takes no message body; its agent call is in
+    `scheduler.run_friction_nudge`, out of the gateway's path).
+  - `POST /webhook/telegram` — **Phase 5**, hardened **Phase 6**. Checks
+    `X-Telegram-Bot-Api-Secret-Token` == `WEBHOOK_SECRET_TOKEN` (401),
+    parses the `Update`, then a per-`chat_id` in-memory sliding-window
+    rate limit (`_telegram_rate_ok`, `TELEGRAM_RATE_LIMIT_PER_MIN`) —
+    over the limit returns **200 immediately** + a background "slow down"
+    reply (so Telegram doesn't retry). Otherwise stashes chat_id /
+    message_id / correlation_id / `background_tasks` on
+    `_telegram_update_ctx` and calls `telegram_app.process_update(update)`.
   - `GET /healthz` — **Phase 5**. `{"status": "ok"}`, no DB/agent touch.
   - `_telegram_reply(text)` — the callback handed to `build_application`.
-    Resolves `HABIT_TRACKER_USERNAME` → `user_id`, invokes the shared
-    agent with that as `thread_id` (mirrors `/chat`, minus the JWT).
+    Size cap → `mask_pii` → resolve `HABIT_TRACKER_USERNAME` → `user_id`
+    → token budget → `_invoke_agent` on that `thread_id` (mirrors
+    `/chat`, minus the JWT). Every user-hidden case (oversized, masking
+    failure, budget, timeout) returns a plain reply string, never an
+    exception.
+  - **Gateway helpers** (`# AI gateway & infrastructure security` +
+    `# Rate limiting` sections): `mask_pii` (email / phone / Luhn-checked
+    card regex → `<EMAIL_MASKED>` etc.), `_telegram_rate_ok`,
+    `_budget_exceeded`, `_turn_token_usage` (sums `usage_metadata` for
+    messages after the last `HumanMessage` — `ainvoke` returns the whole
+    history), `_invoke_agent` (`asyncio.wait_for` on the agent call),
+    `_AgentUnavailable`. `limiter = Limiter(key_func=get_remote_address,
+    swallow_errors=True)` (fail-open); `@limiter.limit` on the four
+    routes with env-configurable limits (`LOGIN_/SIGNUP_/CHAT_/
+    FRICTION_RATE_LIMIT`); `@app.exception_handler(Exception)` →
+    generic 500, real error logged server-side.
+  - **Correlation ids** (Phase 6.1): `_new_correlation_id(prefix)` opens
+    a `ContextVar` scope per request / Telegram update; a logging filter
+    prints `[cid=…]` on every line; the id also rides into the agent
+    trace metadata.
+  - `_agent_config(*, thread_id, tags, metadata, run_name)` builds the
+    `RunnableConfig` (LangSmith tags/metadata; drops `None` metadata).
+    `/chat` → `run_name="web_chat"`, Telegram → `"telegram_chat"`.
   - `__main__` runs `uvicorn.run(app, host="0.0.0.0",
-    port=int(os.environ.get("PORT", 8080)))` — the container entrypoint
-    (`Dockerfile` CMD is `uv run python -m src.main`; Railway injects PORT).
+    port=int(os.environ.get("PORT", 8080)), proxy_headers=True,
+    forwarded_allow_ips="*")` — the container entrypoint (`Dockerfile`
+    CMD is `uv run python -m src.main`; Railway injects PORT). The proxy
+    args let the IP-keyed rate limits see the real caller behind
+    Railway's proxy.
 - `src/app.py` — Streamlit frontend. NO LangChain/LangGraph logic, HTTP
   only. `BACKEND_BASE_URL = os.environ.get("BACKEND_BASE_URL",
   "http://localhost:8000")` (**Phase 5** — Streamlit Cloud sets it via
   app secrets). Login/signup gate, JWT in `st.session_state` only. Drops
   to login on `401`. Chat tab + Progress tab (Plotly trend/heatmap, KPI row).
+  **Phase 6**: the signup form has a "Signup code" field sent as the
+  `X-Signup-Secret` header (matches `auth.require_signup_allowed`).
 - `src/bot.py` — **Phase 2, rewritten Phase 5.** A module, NOT a process —
   no polling, no `__main__`. `build_application(on_message)` builds the
   `python-telegram-bot` `Application` + handlers and stashes the
@@ -190,6 +302,13 @@
   - Weekly, Sunday 23:59 — **Phase 4**. Calls `summarize_memory`'s
     function directly.
   - Both jobs share this one scheduler instance — never a second one.
+  - **Phase 6.1**: `run_friction_nudge(agent, user_id, *, origin,
+    correlation_id)` — the shared flow behind the 20:00 job AND
+    `/evaluate_friction`. `origin` (`"scheduled"` / `"manual-trigger"`)
+    and `correlation_id` ride the LangSmith trace tags/metadata so the
+    two callers are distinguishable; they never affect the coaching.
+    `_environment()` is duplicated here (not imported) — `main` imports
+    this module, so importing back would be circular.
 - `src/mcp_server.py` — **Phase 3, standalone learning exercise, NOT
   connected to the production agent.** FastMCP, stdio transport, run
   independently (Claude Desktop, MCP Inspector). Reuses the `tools.py`
@@ -215,6 +334,10 @@
   the one non-Claude model call in the whole app; `OPENAI_API_KEY`
   required. `HABIT_MEMORY_COLLECTION` env override (default
   `habit_summaries`).
+  - **Phase 6.1**: `add_summary` / `similarity_search` carry
+    `@traceable` (`run_type` `chain` / `retriever`) with a
+    `process_inputs` allow-list scrubber (query / user_id / k / doc_id /
+    text length / metadata keys only — never raw secrets).
 - `src/summarize_memory.py` — **Phase 4**, unchanged in Phase 5.
   `summarize_user_week(user_id,
   *, today=None)` — importable (not just a script; `scheduler.py` calls
@@ -226,11 +349,28 @@
   Returns `None` when the user has no habits or no logged activity.
   `__main__` (`uv run python -m src.summarize_memory`) runs it for
   `HABIT_TRACKER_USERNAME`.
+  - **Phase 6.1**: `summarize_user_week` carries `@traceable`
+    (`run_type="chain"`) with a `process_inputs` scrubber that passes
+    only `{user_id, today}`.
 - `pytest.ini` — **Phase 4**, root level. Sets `asyncio_mode = auto` so
-  `pytest-asyncio` handles the agent's async invocation in
-  `evaluation/test_rag_agent.py` without per-test decoration. No
-  LangSmith/tracing configuration — not in use yet, deferred to Phase 6
-  when a security/observability layer is added.
+  `pytest-asyncio` handles the async agent invocations in
+  `evaluation/test_rag_agent.py` / `test_guardrails.py` without per-test
+  decoration. LangSmith tracing is disabled per-suite by fixtures (see
+  below), not here.
+- `tests/` — **Phase 6**, root-level, separate from `evaluation/` (same
+  `src/` isolation rule — `src/` never imports from here). Non-mocked
+  integration tests against real infrastructure.
+  - `tests/conftest.py` — `load_dotenv`, forces `LANGSMITH_TRACING=false`,
+    `os.environ.setdefault("TESTCONTAINERS_RYUK_DISABLED", "true")` (Ryuk
+    bind-mounts the Docker socket, which Colima rejects). Session fixture
+    `pgvector_url`: `TEST_DATABASE_URL` (must differ from `DATABASE_URL`)
+    if set, else a disposable `pgvector/pgvector:pg16` container via
+    `testcontainers`, else `pytest.skip`.
+  - `tests/test_vector_store_integration.py` — real write / read /
+    per-user-`filter`-isolation / `doc_id`-upsert tests of
+    `vector_store.HabitMemoryStore` against that Postgres. Module-skips
+    without `OPENAI_API_KEY` (real `text-embedding-3-small` calls). Uses
+    a throwaway collection, torn down after.
 - `evaluation/` — **Phase 4, root-level, strictly isolated from `src/`.**
   `evaluation/` may import from `src/`; `src/` never imports from
   `evaluation/`.
@@ -257,7 +397,28 @@
   - `evaluation/conftest.py` — minimal. Carries no vector-store-seeding
     logic (dead code once retrieval is mocked — nothing ever reaches a
     real collection). Holds only fixtures the mocked suite actually needs,
-    e.g. loading the golden dataset JSON.
+    e.g. loading the golden dataset JSON. Loads `.env` (which sets
+    `LANGSMITH_TRACING=true`), so each suite turns tracing back off with
+    its own `no_langsmith_tracing` fixture.
+  - `evaluation/test_guardrails.py` — **Phase 6**. Drives the real agent
+    end to end: safe requests pass through and hit tools; realistic
+    injections are intercepted (`category == "PromptInjection"`, no
+    tools, exact refusal); harmful-behavior gets the *caring* refusal
+    (asserts on category + non-dismissive wording, not exact resource
+    text); off-topic gets the redirect; a monkeypatched `_classifier`
+    failure fails safe; a monkeypatched `_output_classifier` verdict
+    swaps the reply for `_OUTPUT_FALLBACK`. Same isolation as
+    `test_rag_agent.py` (unique thread_id, throwaway SQLite).
+  - `evaluation/test_gateway_security.py` — **Phase 6**. Drives
+    `src/main.py`'s HTTP layer via `TestClient` (lifespan NOT run —
+    `app.state` gets a `_FakeAgent` / fake Telegram app; throwaway
+    SQLite). Covers rate limiting (user-keyed `/chat`, IP-keyed
+    `/auth/login`, chat-id-keyed webhook), the size cap, `mask_pii`
+    (incl. valid vs invalid Luhn), budget blocking, the generic error
+    handler (no leaked internals), and the agent-timeout graceful
+    message. Rate-limit thresholds are set via env vars at the top of
+    the file *before* `import src.main` (limits are frozen into the
+    decorators at import). No real Anthropic / Neon / Telegram.
   - `evaluation/test_rag_agent.py` — loads the golden dataset,
     `@pytest.mark.parametrize` loops through it. Cases are `async def`
     (they `await` the agent); `pytest.ini`'s `asyncio_mode = auto` runs
@@ -292,10 +453,12 @@
       `ContextualPrecisionMetric` (both passed `model=get_judge_model()`,
       or they default to OpenAI) and `CoachingEmpathyMetric()`; collects
       per-metric failures with score + reason. All 6 cases currently pass.
-  - **Still deferred (carry to Phase 6)**: a real (non-mocked) integration
-    test of the vector store pipeline against Neon/pgvector. The migration
-    landed but this test wasn't built; the eval suite still mocks
-    retrieval entirely.
+    - **Phase 6.1**: an autouse `no_langsmith_tracing` fixture forces
+      `LANGSMITH_TRACING=false` (+ `get_env_var.cache_clear()`) so the
+      suite never exports to the real `habit-tracker` project.
+  - The real (non-mocked) vector-store integration test deferred here now
+    exists as `tests/test_vector_store_integration.py` (Phase 6). The eval
+    suite still mocks retrieval — that's deliberate migration-proofing.
 - `Dockerfile` — **Phase 5**. `python:3.13-slim` + `uv`; two-layer cache
   (deps from `pyproject.toml`/`uv.lock` first, then `src/`);
   `CMD ["uv", "run", "python", "-m", "src.main"]` (run as a module —
@@ -309,10 +472,26 @@
 - `run.sh` — starts backend + frontend together; port-based cleanup trap.
 
 # Architecture Notes
-- **Deployed:** FastAPI backend on **Railway** (Docker, rebuilds on push
-  to `main`); one **Neon** Postgres database; Streamlit frontend headed
-  for **Streamlit Cloud** (not yet deployed). Telegram reaches the backend
-  by webhook. No AWS, no GCP, no `supervisord`, no CI pipeline.
+- **Deployed:** FastAPI backend on **Railway** (Docker). Deploys are
+  `railway up` from the CLI — NOT `git push` (the service is not connected
+  to GitHub auto-deploy; a push alone changes nothing). One **Neon**
+  Postgres database; Streamlit frontend headed for **Streamlit Cloud**
+  (not yet deployed). Telegram reaches the backend by webhook. No AWS, no
+  GCP, no `supervisord`, no CI pipeline.
+- **Observability (Phase 6.1):** LangSmith tracing, project
+  `"habit-tracker"`, enabled purely by env (`LANGSMITH_TRACING` /
+  `_API_KEY` / `_PROJECT`). LangChain auto-traces the agent graph; the
+  code adds tags (`web`/`telegram`/`friction-check`, `guardrail_blocked`,
+  …), metadata (user_id, telegram_chat_id, correlation_id, environment),
+  and `run_name`. Trace export is out-of-band — a LangSmith outage never
+  fails a request or a Telegram retry.
+- **Safety (Phase 6):** two layers. Guardrails in the agent
+  (`agent.py` middleware — input classification short-circuits the
+  worker model, output check on the reply) and a gateway in front of it
+  (`main.py` — size cap, PII masking, per-day token budget, timeout,
+  generic errors, rate limits). Both fail safe: the guardrail blocks on
+  classifier error; masking is fail-closed; the rate limiter is
+  fail-open (infra hiccup shouldn't 500 a user).
 - **One Neon database, three concerns:** the relational tables
   (`users`/`habits`/`habit_logs`), the LangGraph checkpoint tables
   (`checkpoints*`), and pgvector (`langchain_pg_*`, collection
@@ -343,14 +522,28 @@
   set `TELEGRAM_WEBHOOK_URL` to `https://<tunnel>/webhook/telegram`.
 - Trigger a nudge manually: `POST /evaluate_friction` while logged in
 - Generate this week's memory summary now: `uv run python -m src.summarize_memory`
-- Run the evaluation suite: `uv run pytest evaluation/` — real Anthropic +
-  OpenAI-embedding calls; ~1 agent + 3 opus-5 judge calls per golden case,
-  ~3.5 min for the 6 cases. Needs `ANTHROPIC_API_KEY` + `OPENAI_API_KEY`
-  (does NOT need `DATABASE_URL` — it mocks retrieval and uses a throwaway
-  SQLite).
-- Deploy the backend: `git push origin main` → Railway rebuilds the
-  `Dockerfile` and redeploys. Env is set via `railway variables` /
-  dashboard, not committed.
+- Run the RAG/coaching evaluation suite: `uv run pytest evaluation/test_rag_agent.py`
+  — real Anthropic + OpenAI-embedding calls; ~1 agent + 3 opus-5 judge
+  calls per golden case, ~3.5 min for the 6 cases. Needs `ANTHROPIC_API_KEY`
+  + `OPENAI_API_KEY` (does NOT need `DATABASE_URL` — it mocks retrieval
+  and uses a throwaway SQLite).
+- Run the guardrail suite: `uv run pytest evaluation/test_guardrails.py`
+  — real Anthropic (Haiku classifier + Sonnet worker on the pass-through
+  cases). Throwaway SQLite; no `DATABASE_URL`.
+- Run the gateway/security suite: `uv run pytest evaluation/test_gateway_security.py`
+  — fully offline (fake agent), fast, no API keys needed beyond what
+  importing `src` requires.
+- Run the pgvector integration test: `uv run pytest tests/` — needs Docker
+  (spins up a `pgvector/pgvector` container) OR `TEST_DATABASE_URL` set to
+  a scratch DB, plus `OPENAI_API_KEY`. Skips cleanly if neither is
+  available. NEVER point `TEST_DATABASE_URL` at the real `DATABASE_URL`
+  (asserted).
+- Deploy the backend: **`railway up`** (uploads the build context; e.g.
+  `railway up --service <name> --ci`). `git push` does NOT deploy — the
+  service isn't wired to GitHub. Commit + push for history, then
+  `railway up`. Env is set via `railway variables` / dashboard, not
+  committed. Verify with `railway status --json` (`cliCaller`, `reason`)
+  and `/healthz`.
 - Inspect the DB (read-only): `psql "$DATABASE_URL" -c "select * from habits;"`
   (or the SQLite equivalent locally).
 
@@ -368,6 +561,16 @@
   `/webhook/telegram`), `WEBHOOK_SECRET_TOKEN` (any random string).
   Leave `DATABASE_URL` unset for a SQLite-backed local run. On Railway
   these are set via `railway variables`, never committed.
+  - **Phase 6**, all optional (sane defaults; full docs in `.env.example`):
+    `LANGSMITH_TRACING` / `LANGSMITH_API_KEY` / `LANGSMITH_PROJECT`
+    (`habit-tracker`) — tracing off if unset. `SIGNUP_SECRET` — gates
+    `/auth/signup` (open if unset). `LOGIN_/SIGNUP_/CHAT_/FRICTION_RATE_LIMIT`
+    (slowapi strings), `TELEGRAM_RATE_LIMIT_PER_MIN` (int). `MAX_MESSAGE_CHARS`
+    (1000), `MAX_DAILY_QUOTA` (200000 tokens/user/day), `AGENT_TIMEOUT_SECONDS`
+    (30). `GUARDRAIL_TIMEOUT_SECONDS` (8), `GUARDRAIL_OUTPUT_LLM_CHECK` (on),
+    `HARM_SUPPORT_RESOURCE` (override the support-resource text in the
+    harmful-behavior refusal). `TEST_DATABASE_URL` — scratch DB for
+    `tests/` (must differ from `DATABASE_URL`).
 - **Checkpointer uses Neon's DIRECT endpoint; everything else uses the
   POOLED endpoint.** `postgres_checkpointer()` runs server-side prepared
   statements (`prepare_threshold=0`) that PgBouncer transaction pooling
@@ -376,12 +579,15 @@
 - **Telegram is a webhook (`POST /webhook/telegram`), driven from
   `main.py`'s lifespan.** Never re-add `run_polling` / a standalone
   `bot.py` process — polling can't run on Railway/serverless hosting.
-- Provider split (deliberate): every model that GENERATES or JUDGES text
-  is Claude — the agent and weekly summariser on `claude-sonnet-5`, the
-  DeepEval judge on `claude-opus-5`. `OPENAI_API_KEY` is used for exactly
-  one thing: `OpenAIEmbeddings("text-embedding-3-small")` in
+- Provider split (deliberate): every model that GENERATES, JUDGES, or
+  CLASSIFIES text is Claude — the agent and weekly summariser on
+  `claude-sonnet-5`, the guardrail input/output classifiers on
+  `claude-haiku-4-5-20251001` (fastest tier; `agent.CLASSIFIER_MODEL`),
+  the DeepEval judge on `claude-opus-5`. `OPENAI_API_KEY` is used for
+  exactly one thing: `OpenAIEmbeddings("text-embedding-3-small")` in
   `vector_store.py`. `openai` is also DeepEval's unconditional base
-  dependency. Do not route any generation or judging through OpenAI.
+  dependency. Do not route any generation, judging, or classification
+  through OpenAI — including in error/fallback paths.
 - Tools derive the acting user only from `runtime` (ToolRuntime), never
   an LLM-supplied argument.
 - `app.py`: no LangChain/LangGraph/DB logic, HTTP only. `bot.py`: no
@@ -432,10 +638,44 @@
   flakiness. No `seed` parameter is set — Anthropic's API has no
   equivalent to OpenAI's `seed`, so don't add one under the assumption
   it will work.
-- A real (non-mocked) integration test of the vector store pipeline
-  against Neon/pgvector is still unbuilt — carry it to Phase 6.
+- The real (non-mocked) vector-store integration test now lives in
+  `tests/test_vector_store_integration.py` (Phase 6) — the eval suite
+  still mocks retrieval on purpose. Never run either against the real
+  `DATABASE_URL`.
+- **Guardrails (Phase 6) live as `create_agent` middleware, never a
+  hand-built `StateGraph`** — the `AsyncPostgresSaver` checkpointer
+  persists at node boundaries, and a bespoke graph would fight that.
+  The deterministic regex pre-filter ALWAYS runs before the classifier
+  call and short-circuits on a hit. Classifier failure/timeout must fail
+  SAFE (block / replace), never open. Don't put a `Field(max_length=…)`
+  on an LLM free-text output field — the model overruns it and structured
+  parsing throws (this already caused a fail-safe on a good reply once).
+- **The gateway (Phase 6) covers exactly the two agent entry points —
+  `/chat` and the Telegram webhook.** `/evaluate_friction` is out of its
+  path by design. Order at each entry point: rate limit → size cap →
+  PII masking → token budget → timed agent call → record usage. Masking
+  is fail-CLOSED; the rate limiter is fail-OPEN; the budget check is
+  fail-open.
+- **PII masking is `main.mask_pii` (plain `re`) — never add Presidio or
+  another NLP dep.** It's applied at the entry point only; raw chat text
+  never reaches `summarize_memory` / the embedding path (that's built
+  from `HabitLog` rows, and habit names the agent creates are already
+  masked). `vector_store.py` / `summarize_memory.py` need no masking.
+- **`_turn_token_usage` sums `usage_metadata` only for messages after the
+  last `HumanMessage`** — `agent.ainvoke` returns the whole accumulated
+  history; summing all of it re-counts every prior turn.
+- **LangSmith calls are best-effort and wrapped** — `get_current_run_tree()`,
+  `@traceable`, tag adds all sit in try/except or are pure dict-building.
+  A tracing failure must never fail a user request. Test suites that
+  touch real Claude force `LANGSMITH_TRACING=false` via a fixture.
+- **`client.list_runs()` is deprecated** (removed after 2027-01-31) — for
+  reading runs use `client.runs.query()`. The app itself never reads
+  runs; the "legacy API usage detected" LangSmith banner comes from
+  ad-hoc `list_runs()` debugging calls and self-clears.
 - No circular imports (`main → agent → tools → database`; `main → bot`
-  with no cycle back; `auth` is a leaf).
+  with no cycle back; `auth` is a leaf; `main → scheduler` /
+  `main → agent` with `_environment` duplicated in `scheduler` to avoid
+  a cycle back to `main`).
 - Never run tests against the real Neon database or a real
   `habits.db`/`checkpoints.db` — use an isolated throwaway DB (the eval
   suite already does). Read-only inspection is fine.
@@ -454,17 +694,25 @@
 - JWT has no refresh flow — Streamlit re-logs in on expiry. (Nothing
   compensates any more; the bot no longer holds a JWT.)
 - `mcp_server.py` is a separate learning exercise, not integrated —
-  tools/data there don't reflect any additional safeguards beyond what's
-  listed above.
-- The evaluation suite tests agent reasoning over mocked retrieval, not
-  the real vector store pipeline — a real Neon/pgvector integration test
-  is still unbuilt (Phase 6).
+  tools/data there don't reflect the Phase 6 guardrails or gateway; its
+  only safeguards are the ones listed above.
+- The evaluation suite tests agent reasoning over mocked retrieval; the
+  real vector-store pipeline is covered separately by `tests/` (Phase 6).
 - `deepeval` / `pytest` / `pytest-asyncio` are still in
   `[project.dependencies]`, so `uv sync --no-dev` in the `Dockerfile`
   doesn't drop them — the Railway image carries them (harmless bloat).
-  Moving them to a dev group is a Phase 6 cleanup.
-- No LangSmith/observability tracing yet — planned for Phase 6 alongside
-  a security layer, not currently configured anywhere.
+  `testcontainers` is correctly in `[dependency-groups] dev`.
+- **`src/bot.py` still echoes exception text to the Telegram user**
+  (`"⚠️ Sorry, something went wrong: {exc}"`). `_telegram_reply` no
+  longer raises for gateway-handled cases (size / masking / budget /
+  timeout all return strings), but an unexpected error (or the
+  "no account for HABIT_TRACKER_USERNAME" `RuntimeError`) still leaks
+  through `bot.py`. `bot.py` was out of scope for the Phase 6 gateway
+  work — a small follow-up.
+- The token budget counts only the worker model (`claude-sonnet-5`); the
+  Haiku guardrail classifier's tokens are not metered. PII masking is a
+  regex heuristic — it will miss unusual formats and can over-mask an
+  odd bare 10-15 digit run.
 - **Deployment gaps:** the Streamlit frontend is prepared for Streamlit
   Cloud but not actually deployed. `src/bot.py` is no longer runnable on
   its own (`python -m src.bot` is a no-op) — local Telegram testing needs
@@ -475,7 +723,10 @@
 - Neon free tier suspends the compute after ~5 min idle — the first
   request after idle pays a ~0.5s reconnect (the pool's `check` handles
   the stale connection).
-- Backend is public on Railway with **open signup** (`/auth/signup`) —
-  anyone with the URL can create an account and spend the Anthropic
-  budget. Gating it is a Phase 6 security item.
+- Rate limiting and the Telegram sliding window are **in-memory /
+  per-process** — correct for the single Railway instance, but a
+  horizontally-scaled deploy would need a shared store (Redis).
+- `/auth/signup` is gated by `SIGNUP_SECRET` in deployment, but stays
+  fully open whenever that var is unset (local dev, or a misconfigured
+  deploy).
 
