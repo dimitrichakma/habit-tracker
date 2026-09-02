@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 
 from langchain.agents import create_agent
-from langchain.agents.middleware import ModelRequest, SummarizationMiddleware, dynamic_prompt
+from langchain.agents.middleware import ModelRequest, dynamic_prompt
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import SystemMessage
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
@@ -20,16 +20,6 @@ from .tools import TOOLS
 # from main.py's JWT auth, never a client-supplied string.
 
 MODEL_NAME = "claude-sonnet-5"
-# Model that condenses old conversation turns once a thread gets long (see
-# build_agent). Claude, per the project's provider split — a coaching thread's
-# history is text being generated, so it can't route through OpenAI.
-HISTORY_SUMMARY_MODEL = "claude-sonnet-5"
-# Condense the thread once its messages pass this many (approx) tokens, keeping
-# the most recent turns verbatim. The agent re-queries every tool fresh each
-# turn (never trusts remembered state), so trimming old history is cheap in
-# accuracy and large in latency/cost on a months-old single-user thread.
-HISTORY_SUMMARY_TRIGGER_TOKENS = 4000
-HISTORY_SUMMARY_KEEP_MESSAGES = 20
 # SQLite fallback checkpoint file — used only when build_agent() gets no
 # checkpointer (local dev without a Postgres URL, and the Phase 4 eval suite,
 # which monkeypatches this constant to a temp path). Deployment runs on
@@ -177,21 +167,12 @@ async def build_agent(checkpointer=None):
     and laptops never need Postgres.
     """
     model = ChatAnthropic(model=MODEL_NAME)
-    # Condense old turns once the thread grows past the trigger; keeps the last
-    # HISTORY_SUMMARY_KEEP_MESSAGES verbatim. Only fires on long threads (a one-
-    # shot message never triggers it, so the eval suite is unaffected) — when it
-    # does, it costs one extra Claude call, after which every turn is cheaper.
-    history_summarizer = SummarizationMiddleware(
-        model=ChatAnthropic(model=HISTORY_SUMMARY_MODEL),
-        trigger=("tokens", HISTORY_SUMMARY_TRIGGER_TOKENS),
-        keep=("messages", HISTORY_SUMMARY_KEEP_MESSAGES),
-    )
 
     def _compile(saver):
         return create_agent(
             model,
             tools=TOOLS,
-            middleware=[history_summarizer, habit_coach_prompt],
+            middleware=[habit_coach_prompt],
             checkpointer=saver,
         )
 
