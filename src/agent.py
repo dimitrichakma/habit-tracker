@@ -4,8 +4,9 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 
 from langchain.agents import create_agent
-from langchain.agents.middleware import ModelRequest, dynamic_prompt
+from langchain.agents.middleware import ModelRequest, SummarizationMiddleware, dynamic_prompt
 from langchain_anthropic import ChatAnthropic
+from langchain_core.messages import SystemMessage
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from psycopg.rows import dict_row
@@ -19,13 +20,23 @@ from .tools import TOOLS
 # from main.py's JWT auth, never a client-supplied string.
 
 MODEL_NAME = "claude-sonnet-5"
+# Model that condenses old conversation turns once a thread gets long (see
+# build_agent). Claude, per the project's provider split — a coaching thread's
+# history is text being generated, so it can't route through OpenAI.
+HISTORY_SUMMARY_MODEL = "claude-sonnet-5"
+# Condense the thread once its messages pass this many (approx) tokens, keeping
+# the most recent turns verbatim. The agent re-queries every tool fresh each
+# turn (never trusts remembered state), so trimming old history is cheap in
+# accuracy and large in latency/cost on a months-old single-user thread.
+HISTORY_SUMMARY_TRIGGER_TOKENS = 4000
+HISTORY_SUMMARY_KEEP_MESSAGES = 20
 # SQLite fallback checkpoint file — used only when build_agent() gets no
 # checkpointer (local dev without a Postgres URL, and the Phase 4 eval suite,
 # which monkeypatches this constant to a temp path). Deployment runs on
 # AsyncPostgresSaver instead (see postgres_checkpointer / main.py's lifespan).
 CHECKPOINT_DB = "checkpoints.db"
 
-SYSTEM_PROMPT_TEMPLATE = """You are an elite Habit Coach.
+SYSTEM_PROMPT = """You are an elite Habit Coach.
 
 - Be concise. No fluff, no filler.
 - Talk like a coach, not a system: never mention tool names, function names, or
@@ -88,21 +99,34 @@ SYSTEM_PROMPT_TEMPLATE = """You are an elite Habit Coach.
   inject "no active habits", "nothing logged", or tracker setup/reset claims
   based on other tool calls unless the user explicitly asked about data/account
   integrity.
-
-Current server date/time: {now}
 """
+
+_CURRENT_TIME_LABEL = "Current server date/time: "
 
 
 @dynamic_prompt
-def habit_coach_prompt(_request: ModelRequest) -> str:
-    """Recomputed by LangGraph before every single model call (not just
-    once when the agent is built) so {now} is always the real current
-    time — needed for the agent to correctly judge "today" vs "yesterday"
-    when logging a habit. `_request` is unused (the prompt doesn't need
-    per-request state), but @dynamic_prompt always passes one positionally,
-    so it's kept and underscore-prefixed rather than dropped."""
+def habit_coach_prompt(_request: ModelRequest) -> SystemMessage:
+    """Recomputed by LangGraph before every single model call (not just once
+    when the agent is built) so the injected time is always the real current
+    time — needed for the agent to correctly judge "today" vs "yesterday" when
+    logging a habit.
+
+    Returned as two content blocks: the static rules carry an Anthropic prompt-
+    cache breakpoint (`cache_control`), so the tool schemas + these ~90 lines
+    are served from cache on the second model call of a turn and on follow-up
+    turns within the 5-minute TTL. The per-second timestamp is a separate,
+    uncached block placed after the breakpoint so it never busts that cache.
+
+    `_request` is unused (the prompt needs no per-request state) but
+    @dynamic_prompt always passes one positionally, so it's kept and
+    underscore-prefixed rather than dropped."""
     now = datetime.now().isoformat(timespec="seconds")
-    return SYSTEM_PROMPT_TEMPLATE.format(now=now)
+    return SystemMessage(
+        content=[
+            {"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": f"{_CURRENT_TIME_LABEL}{now}"},
+        ]
+    )
 
 
 @asynccontextmanager
@@ -153,12 +177,21 @@ async def build_agent(checkpointer=None):
     and laptops never need Postgres.
     """
     model = ChatAnthropic(model=MODEL_NAME)
+    # Condense old turns once the thread grows past the trigger; keeps the last
+    # HISTORY_SUMMARY_KEEP_MESSAGES verbatim. Only fires on long threads (a one-
+    # shot message never triggers it, so the eval suite is unaffected) — when it
+    # does, it costs one extra Claude call, after which every turn is cheaper.
+    history_summarizer = SummarizationMiddleware(
+        model=ChatAnthropic(model=HISTORY_SUMMARY_MODEL),
+        trigger=("tokens", HISTORY_SUMMARY_TRIGGER_TOKENS),
+        keep=("messages", HISTORY_SUMMARY_KEEP_MESSAGES),
+    )
 
     def _compile(saver):
         return create_agent(
             model,
             tools=TOOLS,
-            middleware=[habit_coach_prompt],
+            middleware=[history_summarizer, habit_coach_prompt],
             checkpointer=saver,
         )
 
