@@ -2,7 +2,10 @@
 
 import logging
 import os
+import sys
+import uuid
 from contextlib import AsyncExitStack, asynccontextmanager
+from contextvars import ContextVar
 from datetime import date, timedelta
 
 from dotenv import load_dotenv
@@ -41,6 +44,90 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
+# --- Observability (Phase 6.1) --------------------------------------------
+# LangSmith tracing is enabled purely by env (LANGSMITH_TRACING / _API_KEY /
+# _PROJECT="habit-tracker" in .env, set via `railway variables` in deployment).
+# LangChain auto-traces the agent graph; the code here only enriches those
+# traces with tags/metadata and adds a per-request correlation id to the logs.
+# Nothing below fails a request if LangSmith is unset or unreachable — trace
+# export is out-of-band, and every enrichment is a plain dict passed to the
+# agent, never a network call.
+
+# Per-request / per-Telegram-update correlation id, stamped on every log line.
+_correlation_id: ContextVar[str] = ContextVar("habit_correlation_id", default="-")
+# Populated by POST /webhook/telegram before process_update() runs inline, so
+# _telegram_reply (which the bot.py callback only hands the message text) can
+# still put chat_id / message_id on the trace.
+_telegram_update_ctx: ContextVar[dict] = ContextVar("habit_telegram_update_ctx", default={})
+
+
+class _CorrelationIdLogFilter(logging.Filter):
+    """Stamps the current correlation id onto every LogRecord so it can render
+    on every log line for the request that is being handled."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.correlation_id = _correlation_id.get()
+        return True
+
+
+def _new_correlation_id(prefix: str) -> str:
+    """Open a new correlation scope for the current request/update and return
+    its id — carried on every subsequent log line and copied into the agent
+    trace metadata."""
+    cid = f"{prefix}-{uuid.uuid4().hex[:12]}"
+    _correlation_id.set(cid)
+    return cid
+
+
+def _configure_request_logging() -> None:
+    """Route the app's own logs to stdout with the correlation id prefixed, and
+    stamp the id onto records flowing through uvicorn's handlers too. Called
+    once at startup; wrapped so a logging quirk can never break the server."""
+    try:
+        cid_filter = _CorrelationIdLogFilter()
+        root = logging.getLogger()
+        stream = next(
+            (h for h in root.handlers if isinstance(h, logging.StreamHandler)), None
+        )
+        if stream is None:
+            stream = logging.StreamHandler(sys.stdout)
+            root.addHandler(stream)
+        stream.addFilter(cid_filter)
+        stream.setFormatter(
+            logging.Formatter("[cid=%(correlation_id)s] %(levelname)s %(name)s: %(message)s")
+        )
+        if root.level == logging.NOTSET or root.level > logging.INFO:
+            root.setLevel(logging.INFO)
+        for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+            for handler in logging.getLogger(name).handlers:
+                handler.addFilter(cid_filter)
+    except Exception:  # never fail startup over logging config
+        logger.warning("Could not attach correlation-id logging.", exc_info=True)
+
+
+def _environment() -> str:
+    """Deployment environment label for LangSmith trace metadata (Phase 6.1)."""
+    return (
+        os.environ.get("APP_ENV")
+        or os.environ.get("RAILWAY_ENVIRONMENT_NAME")
+        or os.environ.get("RAILWAY_ENVIRONMENT")
+        or "local"
+    )
+
+
+def _agent_config(*, thread_id: str, tags: list[str], metadata: dict, run_name: str) -> dict:
+    """A RunnableConfig for an agent.ainvoke() call: the thread_id that scopes
+    every tool to this user, plus LangSmith trace tags/metadata. None-valued
+    metadata is dropped. Never put a JWT, WEBHOOK_SECRET_TOKEN, the bot token,
+    or DB credentials in here."""
+    return {
+        "configurable": {"thread_id": thread_id},
+        "tags": tags,
+        "metadata": {key: value for key, value in metadata.items() if value is not None},
+        "run_name": run_name,
+    }
+
+
 def _checkpointer_conninfo() -> str | None:
     """Neon's DIRECT endpoint as a libpq URL for the agent's Postgres
     checkpointer, or None to fall back to SQLite (local dev without Postgres).
@@ -69,9 +156,23 @@ async def _telegram_reply(message_text: str) -> str:
     finally:
         session.close()
 
+    update_ctx = _telegram_update_ctx.get()
+    config = _agent_config(
+        thread_id=str(user_id),
+        tags=["telegram", "webhook", "habit-tracking"],
+        metadata={
+            "user_id": user_id,
+            "telegram_chat_id": update_ctx.get("telegram_chat_id"),
+            "message_id": update_ctx.get("message_id"),
+            "correlation_id": update_ctx.get("correlation_id"),
+            "environment": _environment(),
+            "source": "telegram",
+        },
+        run_name="telegram_chat",
+    )
     result = await app.state.agent.ainvoke(
         {"messages": [{"role": "user", "content": message_text}]},
-        config={"configurable": {"thread_id": str(user_id)}},
+        config=config,
     )
     return _as_text(result["messages"][-1].content)
 
@@ -84,6 +185,7 @@ async def lifespan(app: FastAPI):
     (Phase 2), builds one shared agent instance that every request reuses for
     the life of the process (see build_agent()'s docstring), and drives the
     Telegram bot in-process via webhook (src/bot.py — no polling)."""
+    _configure_request_logging()
     init_db()
     async with AsyncExitStack() as stack:
         conninfo = _checkpointer_conninfo()
@@ -351,14 +453,27 @@ async def chat(request: ChatRequest, user_id: int = Depends(get_current_user_id)
     which is also what src/tools.py's ToolRuntime reads to scope every tool
     call to the right user's data.
     """
+    correlation_id = _new_correlation_id("chat")
     agent = app.state.agent
+    logger.info("Chat request received (user_id=%s).", user_id)
     result = await agent.ainvoke(
         {"messages": [{"role": "user", "content": request.message}]},
-        config={"configurable": {"thread_id": str(user_id)}},
+        config=_agent_config(
+            thread_id=str(user_id),
+            tags=["web", "chat", "habit-tracking"],
+            metadata={
+                "user_id": user_id,
+                "correlation_id": correlation_id,
+                "environment": _environment(),
+                "source": "web",
+            },
+            run_name="web_chat",
+        ),
     )
     # .content is a plain string for a simple reply, but a list of blocks
     # (thinking + text) once extended thinking kicks in on a longer reply.
     reply = _as_text(result["messages"][-1].content)
+    logger.info("Chat request completed (user_id=%s, reply_chars=%d).", user_id, len(reply))
     return ChatResponse(reply=reply)
 
 
@@ -390,7 +505,10 @@ async def evaluate_friction(user_id: int = Depends(get_current_user_id)) -> Chat
     request-body field — reintroducing a client-supplied user_id here would
     be the exact bug real auth already fixed in /chat.
     """
-    reply = await run_friction_nudge(app.state.agent, user_id)
+    correlation_id = _new_correlation_id("friction")
+    reply = await run_friction_nudge(
+        app.state.agent, user_id, origin="manual-trigger", correlation_id=correlation_id
+    )
     if reply is None:
         return ChatResponse(reply="Nothing pending right now — you're all caught up for today.")
     return ChatResponse(reply=reply)
@@ -452,6 +570,24 @@ async def telegram_webhook(
 
     telegram_app = app.state.telegram_app
     update = Update.de_json(await request.json(), telegram_app.bot)
+    correlation_id = _new_correlation_id("tg")
+
+    incoming = (update.message or update.edited_message) if update else None
+    chat_id = update.effective_chat.id if update and update.effective_chat else None
+    _telegram_update_ctx.set(
+        {
+            "telegram_chat_id": chat_id,
+            "message_id": incoming.message_id if incoming else None,
+            "correlation_id": correlation_id,
+        }
+    )
+    logger.info(
+        "Telegram update received (update_id=%s, chat_id=%s).",
+        getattr(update, "update_id", None),
+        chat_id,
+    )
+    # process_update() runs the handler chain inline in this task, so the
+    # context vars set above are visible to _telegram_reply.
     await telegram_app.process_update(update)
     return {"ok": True}
 

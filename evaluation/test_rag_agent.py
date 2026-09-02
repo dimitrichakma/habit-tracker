@@ -38,6 +38,8 @@ from __future__ import annotations
 import uuid
 
 import pytest
+from langsmith import tracing_context
+from langsmith import utils as ls_utils
 import sqlalchemy
 from sqlalchemy.orm import sessionmaker
 
@@ -59,6 +61,23 @@ CONTEXT_PRECISION_THRESHOLD = 0.7
 EMPATHY_THRESHOLD = 0.7
 
 QUERY_PAST_BEHAVIOR = "query_past_behavior"
+
+
+@pytest.fixture(autouse=True)
+def no_langsmith_tracing(monkeypatch):
+    """Phase 6.1: keep the eval suite out of LangSmith. `conftest.py` loads
+    `.env`, which sets `LANGSMITH_TRACING=true` for the real deployment — but
+    these runs must not export traces to the real "habit-tracker" project or
+    pay per-call tracing latency. Force it off (env + langsmith's cached env
+    lookup + a context override) for every case. Does not touch
+    `isolated_state`, `mock_vector_search`, the per-case `thread_id`, or the
+    `actual_retrieved_context` extraction."""
+    monkeypatch.setenv("LANGSMITH_TRACING", "false")
+    monkeypatch.setenv("LANGCHAIN_TRACING_V2", "false")
+    ls_utils.get_env_var.cache_clear()
+    with tracing_context(enabled=False):
+        yield
+    ls_utils.get_env_var.cache_clear()
 
 
 @pytest.fixture(autouse=True)

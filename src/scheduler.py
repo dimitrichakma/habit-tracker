@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import os
+import uuid
 from datetime import date
 from zoneinfo import ZoneInfo
 
@@ -47,6 +48,18 @@ SUMMARY_MINUTE = 59
 # still fire on Dhaka wall-clock after deploying to a UTC cloud host. Override
 # with the REMINDER_TIMEZONE env var if the account ever moves zones.
 REMINDER_TIMEZONE = ZoneInfo(os.environ.get("REMINDER_TIMEZONE", "Asia/Dhaka"))
+
+
+def _environment() -> str:
+    """Deployment environment label for LangSmith trace metadata (Phase 6.1).
+    Duplicated from main._environment rather than imported — main imports this
+    module, so importing back would be circular (same reason as _reply_text)."""
+    return (
+        os.environ.get("APP_ENV")
+        or os.environ.get("RAILWAY_ENVIRONMENT_NAME")
+        or os.environ.get("RAILWAY_ENVIRONMENT")
+        or "local"
+    )
 
 
 def _resolve_user_id(username: str) -> int:
@@ -98,7 +111,13 @@ def _reply_text(content: object) -> str:
     return ""
 
 
-async def run_friction_nudge(agent, user_id: int) -> str | None:
+async def run_friction_nudge(
+    agent,
+    user_id: int,
+    *,
+    origin: str = "scheduled",
+    correlation_id: str | None = None,
+) -> str | None:
     """The shared 'evening friction check' flow behind BOTH the 20:00 job
     and POST /evaluate_friction — the pending-habit check lives here once,
     never duplicated (CLAUDE.md).
@@ -111,6 +130,11 @@ async def run_friction_nudge(agent, user_id: int) -> str | None:
     micro-commitment reasoning and the never-guess / never-shame persona
     all come from agent.py's system prompt. This function only decides
     whether to nudge and what to ask.
+
+    `origin` ("scheduled" from the 20:00 job, "manual-trigger" from
+    POST /evaluate_friction) and `correlation_id` are recorded on the
+    LangSmith trace so the two callers can be told apart in the dashboard
+    (Phase 6.1). They never affect the coaching itself.
     """
     pending = _pending_habit_names(user_id, date.today())
     if not pending:
@@ -124,9 +148,21 @@ async def run_friction_nudge(agent, user_id: int) -> str | None:
         "follow your normal missed-habit process for it and offer a smaller "
         "micro-commitment. Do not shame the user."
     )
+    metadata = {
+        "user_id": user_id,
+        "origin": origin,
+        "environment": _environment(),
+    }
+    if correlation_id:
+        metadata["correlation_id"] = correlation_id
     result = await agent.ainvoke(
         {"messages": [{"role": "user", "content": trigger}]},
-        config={"configurable": {"thread_id": str(user_id)}},
+        config={
+            "configurable": {"thread_id": str(user_id)},
+            "tags": ["friction-check", origin, "habit-tracking"],
+            "metadata": metadata,
+            "run_name": f"friction_nudge:{origin}",
+        },
     )
     return _reply_text(result["messages"][-1].content) or f"Still pending today: {listed}."
 
@@ -135,7 +171,10 @@ async def _send_reminder(agent, bot_token: str, chat_id: str, user_id: int) -> N
     """The scheduled job. A fresh short-lived Bot per fire (once a day)
     sidesteps python-telegram-bot's connection-lifecycle handling."""
     try:
-        message = await run_friction_nudge(agent, user_id)
+        correlation_id = f"sched-{uuid.uuid4().hex[:12]}"
+        message = await run_friction_nudge(
+            agent, user_id, origin="scheduled", correlation_id=correlation_id
+        )
         if message is None:
             logger.info("Daily check: nothing pending — no reminder sent.")
             return

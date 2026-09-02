@@ -26,9 +26,31 @@ from langchain_core.documents import Document
 from langchain_core.vectorstores import VectorStore
 from langchain_openai import OpenAIEmbeddings
 from langchain_postgres import PGVector
+from langsmith import traceable
 
 COLLECTION_NAME = os.environ.get("HABIT_MEMORY_COLLECTION", "habit_summaries")
 EMBEDDING_MODEL = "text-embedding-3-small"
+
+
+def _scrub_store_inputs(inputs: dict) -> dict:
+    """Phase 6.1 — what LangSmith records as this call's inputs. Explicit
+    allow-list: only the query/topic, the resolved user id, the doc id, and
+    metadata keys. No credentials pass through these methods, but keep the
+    recorded payload deliberately narrow rather than dumping the bound args."""
+    safe: dict = {}
+    if "query" in inputs:
+        safe["query"] = inputs["query"]
+    if "user_id" in inputs:
+        safe["user_id"] = inputs["user_id"]
+    if "k" in inputs:
+        safe["k"] = inputs["k"]
+    if "doc_id" in inputs:
+        safe["doc_id"] = inputs["doc_id"]
+    if inputs.get("text") is not None:
+        safe["text_chars"] = len(inputs["text"])
+    if inputs.get("metadata"):
+        safe["metadata_keys"] = sorted(inputs["metadata"].keys())
+    return safe
 
 
 def _connection_url() -> str:
@@ -83,6 +105,11 @@ class HabitMemoryStore:
         backend-specific method."""
         return self._vectorstore
 
+    @traceable(
+        run_type="chain",
+        name="habit_memory.add_summary",
+        process_inputs=_scrub_store_inputs,
+    )
     def add_summary(
         self,
         *,
@@ -99,6 +126,11 @@ class HabitMemoryStore:
             meta.update(metadata)
         self._vectorstore.add_texts(texts=[text], metadatas=[meta], ids=[doc_id])
 
+    @traceable(
+        run_type="retriever",
+        name="habit_memory.similarity_search",
+        process_inputs=_scrub_store_inputs,
+    )
     def similarity_search(self, query: str, *, user_id: int, k: int = 3) -> list[Document]:
         """Convenience for non-tool callers: top-`k` summaries for this user,
         scoped by the `user_id` metadata filter. `tools.query_past_behavior`

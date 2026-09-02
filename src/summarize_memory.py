@@ -20,6 +20,7 @@ import os
 from datetime import date, timedelta
 
 from langchain_anthropic import ChatAnthropic
+from langsmith import traceable
 
 from .database import Habit, User, get_session
 from .vector_store import get_habit_memory_store
@@ -82,6 +83,20 @@ def _collect_week(user_id: int, today: date) -> tuple[str, int]:
         session.close()
 
 
+def _scrub_summary_inputs(inputs: dict) -> dict:
+    """Phase 6.1 — LangSmith records only the user id and target date for this
+    run, never the pulled habit-log rows or any credential (none reach here)."""
+    return {
+        "user_id": inputs.get("user_id"),
+        "today": str(inputs["today"]) if inputs.get("today") is not None else None,
+    }
+
+
+@traceable(
+    run_type="chain",
+    name="summarize_user_week",
+    process_inputs=_scrub_summary_inputs,
+)
 def summarize_user_week(user_id: int, *, today: date | None = None) -> str | None:
     """Generate and store one weekly behavioral summary for `user_id`.
 
