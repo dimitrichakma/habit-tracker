@@ -11,7 +11,8 @@ import os
 import re
 from datetime import date, datetime, timedelta
 
-from sqlalchemy import Date, DateTime, ForeignKey, String, create_engine, text
+from sqlalchemy import Date, DateTime, ForeignKey, String, UniqueConstraint, create_engine, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
 # Neon (or any Postgres) via DATABASE_URL; falls back to a local SQLite file so
@@ -102,6 +103,26 @@ class HabitLog(Base):
     habit: Mapped["Habit"] = relationship(back_populates="logs")
 
 
+class TokenUsage(Base):
+    """Daily LLM token consumption per account (Phase 6.3 budget guardrail).
+
+    One row per (user_id, calendar day). Both agent entry points — POST /chat
+    and the Telegram webhook — resolve to the same internal user_id, so this
+    single ledger covers both. There is no reset job: a new calendar day simply
+    has no row yet, so the day's usage reads back as 0 (see daily_token_total).
+    """
+
+    __tablename__ = "token_usage"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
+    usage_date: Mapped[date] = mapped_column(Date, nullable=False)
+    input_tokens: Mapped[int] = mapped_column(default=0)
+    output_tokens: Mapped[int] = mapped_column(default=0)
+
+    __table_args__ = (UniqueConstraint("user_id", "usage_date", name="uq_token_usage_user_date"),)
+
+
 def init_db() -> None:
     if engine.dialect.name == "postgresql":
         # pgvector's tables (langchain_pg_*) live in the same database; the
@@ -147,6 +168,72 @@ def get_session() -> Session:
     endpoint) opens its own via this and must close() it when done — see
     the try/finally pattern used everywhere this is called."""
     return SessionLocal()
+
+
+# --- Token budget (Phase 6.3) -----------------------------------------
+# A coarse daily spend guardrail on the Anthropic worker model. Only the
+# worker agent's usage_metadata is tracked here — the fast Haiku guardrail
+# classifier's own token use is not counted (it's small and bounded).
+
+
+def daily_token_total(user_id: int, day: date) -> int:
+    """Total tokens (input + output) this user has consumed on `day`. Returns 0
+    when there is no row yet — which is also how the per-calendar-day reset
+    works (yesterday's row is simply never queried today)."""
+    session = get_session()
+    try:
+        row = (
+            session.query(TokenUsage)
+            .filter(TokenUsage.user_id == user_id, TokenUsage.usage_date == day)
+            .first()
+        )
+        return (row.input_tokens + row.output_tokens) if row else 0
+    finally:
+        session.close()
+
+
+def record_token_usage(user_id: int, day: date, input_tokens: int, output_tokens: int) -> None:
+    """Add token counts to this user's ledger row for `day`, creating it if
+    absent. Runs in a FastAPI BackgroundTask after the agent has replied, so it
+    never adds latency to the response."""
+    if input_tokens <= 0 and output_tokens <= 0:
+        return
+    session = get_session()
+    try:
+        row = (
+            session.query(TokenUsage)
+            .filter(TokenUsage.user_id == user_id, TokenUsage.usage_date == day)
+            .first()
+        )
+        if row is None:
+            session.add(
+                TokenUsage(
+                    user_id=user_id,
+                    usage_date=day,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                )
+            )
+        else:
+            row.input_tokens += input_tokens
+            row.output_tokens += output_tokens
+        session.commit()
+    except IntegrityError:
+        # A concurrent insert beat us to the (user_id, usage_date) row — near
+        # impossible in this single-user app, but the unique constraint keeps it
+        # correct. Retry as a pure increment.
+        session.rollback()
+        row = (
+            session.query(TokenUsage)
+            .filter(TokenUsage.user_id == user_id, TokenUsage.usage_date == day)
+            .first()
+        )
+        if row is not None:
+            row.input_tokens += input_tokens
+            row.output_tokens += output_tokens
+            session.commit()
+    finally:
+        session.close()
 
 
 # --- Shared scheduling logic -------------------------------------------

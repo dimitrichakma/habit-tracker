@@ -1,15 +1,20 @@
 """FastAPI service exposing the habit coaching agent over HTTP."""
 
+import asyncio
 import logging
 import os
+import re
 import sys
+import time
 import uuid
+from collections import defaultdict, deque
 from contextlib import AsyncExitStack, asynccontextmanager
 from contextvars import ContextVar
 from datetime import date, timedelta
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse
 from langchain_core.messages import AIMessage, HumanMessage
 from pydantic import BaseModel, Field
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -33,10 +38,12 @@ from .database import (
     Habit,
     User,
     backfill_orphaned_habits,
+    daily_token_total,
     get_session,
     init_db,
     is_due_today,
     is_satisfied,
+    record_token_usage,
     satisfaction_window_days,
 )
 from .scheduler import run_friction_nudge, start_reminder_scheduler
@@ -144,12 +151,186 @@ def _checkpointer_conninfo() -> str | None:
     return url.replace("postgresql+psycopg://", "postgresql://", 1)
 
 
+# --- AI gateway & infrastructure security (Phase 6.3) -------------------
+# Protections that sit in front of BOTH agent entry points (POST /chat and the
+# Telegram webhook): a per-message size cap, regex PII masking, a daily token
+# budget, and a hard timeout on the agent call. Rate limiting is further down
+# (it needs the FastAPI app object); the Telegram-side limiter is here because
+# it can't use slowapi (see _telegram_rate_ok).
+
+# Longest message accepted before the agent / masking / budget logic runs.
+MAX_MESSAGE_CHARS = int(os.environ.get("MAX_MESSAGE_CHARS", "1000"))
+# Daily input+output token ceiling per account for the worker model.
+MAX_DAILY_QUOTA = int(os.environ.get("MAX_DAILY_QUOTA", "200000"))
+# Hard cap on a single agent turn. On timeout the user gets AGENT_UNAVAILABLE_MESSAGE
+# and the (partially checkpointed) run is abandoned — the next turn resumes from
+# the last node boundary.
+AGENT_TIMEOUT_SECONDS = float(os.environ.get("AGENT_TIMEOUT_SECONDS", "30"))
+# Telegram webhook: messages per chat_id per rolling 60s.
+TELEGRAM_RATE_LIMIT_PER_MIN = int(os.environ.get("TELEGRAM_RATE_LIMIT_PER_MIN", "5"))
+
+AGENT_UNAVAILABLE_MESSAGE = (
+    "The coaching assistant is temporarily unavailable, please try again in a moment."
+)
+
+
+class _AgentUnavailable(Exception):
+    """The agent call exceeded AGENT_TIMEOUT_SECONDS. Caught at each entry point
+    and turned into AGENT_UNAVAILABLE_MESSAGE (never surfaced to the client)."""
+
+
+# --- PII masking -------------------------------------------------------
+# Lightweight regex redaction, not Presidio. Applied to every inbound message
+# before the agent sees it — so before any Anthropic call, before the message
+# lands in the checkpoint store, and (transitively, via the habit names the
+# agent creates from it) before the OpenAI embedding path in summarize_memory /
+# vector_store. Masking failure is fail-CLOSED: the caller blocks rather than
+# forward raw PII.
+
+_EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
+# Realistic phone shapes only, to keep dates / short counts / IDs out of scope:
+#   +CC ... groups   |   (NNN) NNN-NNNN / NNN-NNN-NNNN   |   a bare 10-15 digit run
+_PHONE_RE = re.compile(
+    r"(?<![\w])(?:"
+    r"\+\d{1,3}[\s.\-]?(?:\(?\d{1,4}\)?[\s.\-]?){1,4}\d{2,4}"
+    r"|\(?\d{3}\)?[\s.\-]\d{3}[\s.\-]\d{4}"
+    r"|\d{10,15}"
+    r")(?![\w])"
+)
+# A candidate card is 13-19 digits, optionally in space/dash groups. The Luhn
+# check below is what actually decides — so a plain 16-digit reference number
+# (invalid Luhn) is left untouched.
+_CARD_CANDIDATE_RE = re.compile(r"\b(?:\d[ \-]?){13,19}\b")
+
+
+def _luhn_ok(digits: str) -> bool:
+    total = 0
+    for i, ch in enumerate(reversed(digits)):
+        d = int(ch)
+        if i % 2 == 1:
+            d *= 2
+            if d > 9:
+                d -= 9
+        total += d
+    return total % 10 == 0
+
+
+def _mask_cards(text: str) -> str:
+    def _repl(match: re.Match) -> str:
+        digits = re.sub(r"\D", "", match.group(0))
+        if 13 <= len(digits) <= 19 and _luhn_ok(digits):
+            return "<CARD_MASKED>"
+        return match.group(0)
+
+    return _CARD_CANDIDATE_RE.sub(_repl, text)
+
+
+def mask_pii(text: str) -> str:
+    """Redact emails, phone numbers, and Luhn-valid card numbers. Cards are
+    masked first, before the phone pattern can bite into a card's digits."""
+    text = _mask_cards(text)
+    text = _EMAIL_RE.sub("<EMAIL_MASKED>", text)
+    text = _PHONE_RE.sub("<PHONE_MASKED>", text)
+    return text
+
+
+# --- Telegram webhook rate limiting -----------------------------------
+# slowapi's key_func only sees the Request, never the parsed body — so it can't
+# key on telegram_chat_id. This is a small in-memory sliding window instead,
+# checked synchronously (no await) inside the webhook handler, so no lock is
+# needed on the single-threaded event loop. In-memory and per-process: fine for
+# one Railway instance; a horizontally-scaled deploy would need a shared store
+# (Redis) here and for the slowapi limiter below.
+_telegram_hits: dict[int, deque] = defaultdict(deque)
+
+
+def _telegram_rate_ok(chat_id: int) -> bool:
+    """True if this chat is under TELEGRAM_RATE_LIMIT_PER_MIN over the trailing
+    60s. Fail-open: any bookkeeping error lets the message through."""
+    try:
+        now = time.monotonic()
+        hits = _telegram_hits[chat_id]
+        while hits and now - hits[0] > 60.0:
+            hits.popleft()
+        if len(hits) >= TELEGRAM_RATE_LIMIT_PER_MIN:
+            return False
+        hits.append(now)
+        return True
+    except Exception:  # never block a message over a limiter bug
+        logger.warning("Telegram rate-limit check errored — allowing the message.", exc_info=True)
+        return True
+
+
+# --- token budget + timed agent invocation ---------------------------
+
+
+def _budget_exceeded(user_id: int) -> bool:
+    """Whether this user has hit MAX_DAILY_QUOTA today. Fail-open: a ledger read
+    error logs and allows the turn rather than hard-blocking coaching."""
+    try:
+        return daily_token_total(user_id, date.today()) >= MAX_DAILY_QUOTA
+    except Exception:
+        logger.warning("Token-budget check failed — allowing the request.", exc_info=True)
+        return False
+
+
+def _turn_token_usage(messages: list) -> tuple[int, int]:
+    """(input, output) worker-model tokens for THIS turn only — the messages
+    after the last HumanMessage. agent.ainvoke returns the full accumulated
+    history, so summing the whole list would re-count every prior turn."""
+    last_human = -1
+    for i, message in enumerate(messages):
+        if isinstance(message, HumanMessage):
+            last_human = i
+    inp = out = 0
+    for message in messages[last_human + 1:]:
+        usage = getattr(message, "usage_metadata", None)
+        if usage:
+            inp += usage.get("input_tokens", 0) or 0
+            out += usage.get("output_tokens", 0) or 0
+    return inp, out
+
+
+async def _invoke_agent(message_text: str, config: dict) -> dict:
+    """One agent turn with a hard timeout (AGENT_TIMEOUT_SECONDS). Raises
+    _AgentUnavailable on timeout; other errors (Anthropic API failures included)
+    propagate to the generic exception handler."""
+    try:
+        return await asyncio.wait_for(
+            app.state.agent.ainvoke(
+                {"messages": [{"role": "user", "content": message_text}]},
+                config=config,
+            ),
+            timeout=AGENT_TIMEOUT_SECONDS,
+        )
+    except (asyncio.TimeoutError, TimeoutError):
+        logger.warning("Agent invocation timed out after %.0fs.", AGENT_TIMEOUT_SECONDS)
+        raise _AgentUnavailable from None
+
+
 async def _telegram_reply(message_text: str) -> str:
     """Drive the shared agent for one inbound Telegram message, acting as the
     single configured account (HABIT_TRACKER_USERNAME). This is the callback
     src/bot.py's message handler invokes — it mirrors POST /chat, minus the
     JWT: on Telegram, identity is the fixed account, resolved server-side
-    here, never taken from the message."""
+    here, never taken from the message.
+
+    Gateway checks (Phase 6.3), in order, before the agent runs: size cap ->
+    PII masking -> daily token budget. A per-chat rate limit is applied earlier,
+    in the webhook handler. Anything the user shouldn't see (an oversized
+    message, a masking failure, a timeout, the budget ceiling) comes back as a
+    plain reply string, never an exception."""
+    if len(message_text) > MAX_MESSAGE_CHARS:
+        return (
+            f"Please keep your messages under {MAX_MESSAGE_CHARS} characters — "
+            "send it in a couple of shorter messages and I'll keep up."
+        )
+    try:
+        message_text = mask_pii(message_text)
+    except Exception:
+        logger.warning("PII masking failed on a Telegram message — blocking (fail-closed).", exc_info=True)
+        return "Sorry — I couldn't process that message. Please try rephrasing it."
+
     username = os.environ["HABIT_TRACKER_USERNAME"]
     session = get_session()
     try:
@@ -159,6 +340,9 @@ async def _telegram_reply(message_text: str) -> str:
         user_id = user.id
     finally:
         session.close()
+
+    if _budget_exceeded(user_id):
+        return "You've hit today's usage limit for the coach — check back tomorrow."
 
     update_ctx = _telegram_update_ctx.get()
     config = _agent_config(
@@ -174,10 +358,18 @@ async def _telegram_reply(message_text: str) -> str:
         },
         run_name="telegram_chat",
     )
-    result = await app.state.agent.ainvoke(
-        {"messages": [{"role": "user", "content": message_text}]},
-        config=config,
-    )
+    try:
+        result = await _invoke_agent(message_text, config)
+    except _AgentUnavailable:
+        return AGENT_UNAVAILABLE_MESSAGE
+
+    inp, out = _turn_token_usage(result["messages"])
+    background_tasks = update_ctx.get("background_tasks")
+    if background_tasks is not None:
+        background_tasks.add_task(record_token_usage, user_id, date.today(), inp, out)
+    else:  # no request context (shouldn't happen via the webhook) — record inline
+        record_token_usage(user_id, date.today(), inp, out)
+
     return _as_text(result["messages"][-1].content)
 
 
@@ -236,20 +428,53 @@ async def lifespan(app: FastAPI):
             scheduler.shutdown(wait=False)
 
 
-# --- Rate limiting (Phase 6.2) -------------------------------------------
-# In-memory limiter (fine for the single Railway instance — no Redis). Keyed
-# by client IP; `uvicorn.run` below sets proxy_headers so that's the real
-# caller behind Railway's proxy, not the proxy itself.
-LOGIN_RATE_LIMIT = os.environ.get("LOGIN_RATE_LIMIT", "5/minute")
-SIGNUP_RATE_LIMIT = os.environ.get("SIGNUP_RATE_LIMIT", "3/minute")
-CHAT_RATE_LIMIT = os.environ.get("CHAT_RATE_LIMIT", "20/minute")
-FRICTION_RATE_LIMIT = os.environ.get("FRICTION_RATE_LIMIT", "10/minute")
+# --- Rate limiting (Phase 6.2 / 6.3) ------------------------------------
+# In-memory limiter (fine for the single Railway instance — no Redis; a
+# horizontally-scaled deploy would need a shared storage_uri). `uvicorn.run`
+# below sets proxy_headers so IP-keyed limits see the real caller behind
+# Railway's proxy, not the proxy itself. swallow_errors=True makes the limiter
+# fail-OPEN: a storage hiccup lets the request through rather than 500-ing it.
+LOGIN_RATE_LIMIT = os.environ.get("LOGIN_RATE_LIMIT", "5/minute")  # by IP (brute-force)
+SIGNUP_RATE_LIMIT = os.environ.get("SIGNUP_RATE_LIMIT", "3/minute")  # by IP
+CHAT_RATE_LIMIT = os.environ.get("CHAT_RATE_LIMIT", "20/minute")  # by authed user_id (6.3)
+FRICTION_RATE_LIMIT = os.environ.get("FRICTION_RATE_LIMIT", "10/minute")  # by IP
 
-limiter = Limiter(key_func=get_remote_address)
+limiter = Limiter(key_func=get_remote_address, swallow_errors=True)
+
+
+async def _rate_limit_user_id(request: Request, user_id: int = Depends(get_current_user_id)) -> int:
+    """get_current_user_id, plus it stashes the verified id on request.state so
+    the /chat rate limiter can key on the authenticated user rather than the
+    shared proxy IP. FastAPI resolves dependencies before slowapi's limit check
+    runs, so request.state.user_id is populated by the time _user_id_rate_key
+    is called."""
+    request.state.user_id = user_id
+    return user_id
+
+
+def _user_id_rate_key(request: Request) -> str:
+    """Rate-limit key for /chat: the authenticated user id, or the client IP as
+    a fallback if auth hasn't run (it always has, on /chat)."""
+    user_id = getattr(request.state, "user_id", None)
+    return f"user:{user_id}" if user_id is not None else get_remote_address(request)
+
 
 app = FastAPI(title="Habit Tracker", lifespan=lifespan)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Catch-all (Phase 6.3): the client only ever sees a generic message — no
+    stack trace, no DB / connection detail, no internal path. The real
+    exception is logged server-side. HTTPException and RateLimitExceeded have
+    their own, more specific handlers and are unaffected."""
+    logger.exception("Unhandled error on %s %s", request.method, request.url.path)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Something went wrong on our end. Please try again."},
+    )
 
 
 @app.middleware("http")
@@ -489,11 +714,12 @@ async def habits_stats(days: int = 30, user_id: int = Depends(get_current_user_i
 
 
 @app.post("/chat", response_model=ChatResponse)
-@limiter.limit(CHAT_RATE_LIMIT)
+@limiter.limit(CHAT_RATE_LIMIT, key_func=_user_id_rate_key)
 async def chat(
     request: Request,
     payload: ChatRequest,
-    user_id: int = Depends(get_current_user_id),
+    background_tasks: BackgroundTasks,
+    user_id: int = Depends(_rate_limit_user_id),
 ) -> ChatResponse:
     """Send one message to the Habit Coach and get its reply.
 
@@ -503,26 +729,48 @@ async def chat(
     which is also what src/tools.py's ToolRuntime reads to scope every tool
     call to the right user's data.
 
-    Rate-limited (Phase 6.2) as a backstop on Anthropic spend; `request:
+    Gateway checks (Phase 6.3), before the agent runs: rate limit (keyed on
+    this user_id), size cap, PII masking, daily token budget. `request:
     Request` is required by the limiter.
     """
     correlation_id = _new_correlation_id("chat")
-    agent = app.state.agent
+    if len(payload.message) > MAX_MESSAGE_CHARS:
+        raise HTTPException(
+            413,
+            f"Please keep your message under {MAX_MESSAGE_CHARS} characters — "
+            "send it in a couple of shorter messages.",
+        )
+    try:
+        message = mask_pii(payload.message)
+    except Exception:
+        logger.warning("PII masking failed — blocking the request (fail-closed).", exc_info=True)
+        raise HTTPException(500, "Something went wrong on our end. Please try again.") from None
+
+    if _budget_exceeded(user_id):
+        raise HTTPException(429, "You've reached today's usage limit. Please try again tomorrow.")
+
     logger.info("Chat request received (user_id=%s).", user_id)
-    result = await agent.ainvoke(
-        {"messages": [{"role": "user", "content": payload.message}]},
-        config=_agent_config(
-            thread_id=str(user_id),
-            tags=["web", "chat", "habit-tracking"],
-            metadata={
-                "user_id": user_id,
-                "correlation_id": correlation_id,
-                "environment": _environment(),
-                "source": "web",
-            },
-            run_name="web_chat",
-        ),
-    )
+    try:
+        result = await _invoke_agent(
+            message,
+            _agent_config(
+                thread_id=str(user_id),
+                tags=["web", "chat", "habit-tracking"],
+                metadata={
+                    "user_id": user_id,
+                    "correlation_id": correlation_id,
+                    "environment": _environment(),
+                    "source": "web",
+                },
+                run_name="web_chat",
+            ),
+        )
+    except _AgentUnavailable:
+        return ChatResponse(reply=AGENT_UNAVAILABLE_MESSAGE)
+
+    inp, out = _turn_token_usage(result["messages"])
+    background_tasks.add_task(record_token_usage, user_id, date.today(), inp, out)
+
     # .content is a plain string for a simple reply, but a list of blocks
     # (thinking + text) once extended thinking kicks in on a longer reply.
     reply = _as_text(result["messages"][-1].content)
@@ -612,15 +860,29 @@ async def healthz() -> dict[str, str]:
     return {"status": "ok"}
 
 
+async def _send_telegram_notice(chat_id: int, text: str) -> None:
+    """Best-effort out-of-band Telegram message (e.g. a rate-limit notice),
+    sent from a background task so the webhook can return 200 immediately."""
+    try:
+        await app.state.telegram_app.bot.send_message(chat_id=chat_id, text=text)
+    except Exception:
+        logger.warning("Could not send a Telegram notice to chat_id=%s.", chat_id, exc_info=True)
+
+
 @app.post("/webhook/telegram")
 async def telegram_webhook(
     request: Request,
+    background_tasks: BackgroundTasks,
     x_telegram_bot_api_secret_token: str | None = Header(default=None),
 ) -> dict[str, bool]:
     """Telegram delivers updates here (URL registered via set_webhook in the
     lifespan). Telegram echoes the secret token we set on every request, in
     the X-Telegram-Bot-Api-Secret-Token header — that's what proves the call
-    is really from Telegram. Any mismatch or missing header → 401."""
+    is really from Telegram. Any mismatch or missing header → 401.
+
+    Rate-limited per chat_id (Phase 6.3): over the limit, this returns 200
+    straight away — so Telegram doesn't queue retries — plus one out-of-band
+    "slow down" reply."""
     expected = os.environ.get("WEBHOOK_SECRET_TOKEN")
     if not x_telegram_bot_api_secret_token or x_telegram_bot_api_secret_token != expected:
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -631,11 +893,22 @@ async def telegram_webhook(
 
     incoming = (update.message or update.edited_message) if update else None
     chat_id = update.effective_chat.id if update and update.effective_chat else None
+
+    if chat_id is not None and not _telegram_rate_ok(chat_id):
+        logger.warning("Telegram rate limit hit for chat_id=%s.", chat_id)
+        background_tasks.add_task(
+            _send_telegram_notice,
+            chat_id,
+            "You're sending messages faster than I can keep up — give me a minute, then try again.",
+        )
+        return {"ok": True}
+
     _telegram_update_ctx.set(
         {
             "telegram_chat_id": chat_id,
             "message_id": incoming.message_id if incoming else None,
             "correlation_id": correlation_id,
+            "background_tasks": background_tasks,
         }
     )
     logger.info(
