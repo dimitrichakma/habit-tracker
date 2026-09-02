@@ -206,7 +206,13 @@ if st.session_state.token is None:
     password = st.text_input("Password", type="password")
 
     password_ok = True
+    signup_code = ""
     if mode == "Sign up":
+        signup_code = st.text_input(
+            "Signup code",
+            type="password",
+            help="Required when the backend has SIGNUP_SECRET set. Leave blank for a local backend with open signup.",
+        )
         st.caption("Password requirements:")
         password_ok = True
         for label, check in PASSWORD_REQUIREMENTS:
@@ -218,8 +224,11 @@ if st.session_state.token is None:
 
     if st.button(mode, disabled=(mode == "Sign up" and not password_ok)):
         url = LOGIN_URL if mode == "Log in" else SIGNUP_URL
+        headers = {"X-Signup-Secret": signup_code} if (mode == "Sign up" and signup_code) else None
         try:
-            response = requests.post(url, json={"username": username, "password": password}, timeout=10)
+            response = requests.post(
+                url, json={"username": username, "password": password}, headers=headers, timeout=10
+            )
             response.raise_for_status()
             st.session_state.token = response.json()["access_token"]
             st.session_state.username = username

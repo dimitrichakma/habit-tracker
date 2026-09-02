@@ -12,6 +12,9 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from langchain_core.messages import AIMessage, HumanMessage
 from pydantic import BaseModel, Field
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 from telegram import Update
 
 load_dotenv()
@@ -23,6 +26,7 @@ from .auth import (
     get_current_user_id,
     hash_password,
     password_requirement_status,
+    require_signup_allowed,
     verify_password,
 )
 from .database import (
@@ -232,7 +236,34 @@ async def lifespan(app: FastAPI):
             scheduler.shutdown(wait=False)
 
 
+# --- Rate limiting (Phase 6.2) -------------------------------------------
+# In-memory limiter (fine for the single Railway instance — no Redis). Keyed
+# by client IP; `uvicorn.run` below sets proxy_headers so that's the real
+# caller behind Railway's proxy, not the proxy itself.
+LOGIN_RATE_LIMIT = os.environ.get("LOGIN_RATE_LIMIT", "5/minute")
+SIGNUP_RATE_LIMIT = os.environ.get("SIGNUP_RATE_LIMIT", "3/minute")
+CHAT_RATE_LIMIT = os.environ.get("CHAT_RATE_LIMIT", "20/minute")
+FRICTION_RATE_LIMIT = os.environ.get("FRICTION_RATE_LIMIT", "10/minute")
+
+limiter = Limiter(key_func=get_remote_address)
+
 app = FastAPI(title="Habit Tracker", lifespan=lifespan)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    """Baseline hardening headers on every response (Phase 6.2). HSTS is only
+    honoured over HTTPS, which is what Railway serves."""
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault(
+        "Strict-Transport-Security", "max-age=31536000; includeSubDomains"
+    )
+    return response
 
 
 class SignupRequest(BaseModel):
@@ -250,22 +281,32 @@ class TokenResponse(BaseModel):
     token_type: str = "bearer"
 
 
-@app.post("/auth/signup", response_model=TokenResponse, status_code=201)
-async def signup(request: SignupRequest) -> TokenResponse:
+@app.post(
+    "/auth/signup",
+    response_model=TokenResponse,
+    status_code=201,
+    dependencies=[Depends(require_signup_allowed)],
+)
+@limiter.limit(SIGNUP_RATE_LIMIT)
+async def signup(request: Request, payload: SignupRequest) -> TokenResponse:
     """Create a new account and return a JWT for it.
 
-    Password strength is checked before anything else touches the database —
-    fail fast, and avoid a half-created-user edge case if it were checked later.
+    Gated by `require_signup_allowed` (Phase 6.2): when SIGNUP_SECRET is set,
+    the request must carry a matching X-Signup-Secret header. Password strength
+    is checked before anything else touches the database — fail fast, and avoid
+    a half-created-user edge case if it were checked later.
+
+    `request: Request` is unused by the body but required by the rate limiter.
     """
-    unmet = [label for label, met in password_requirement_status(request.password) if not met]
+    unmet = [label for label, met in password_requirement_status(payload.password) if not met]
     if unmet:
         raise HTTPException(422, "Password must include: " + "; ".join(unmet) + ".")
 
     session = get_session()
     try:
-        if session.query(User).filter(User.username == request.username).first() is not None:
+        if session.query(User).filter(User.username == payload.username).first() is not None:
             raise HTTPException(409, "That username is already taken.")
-        user = User(username=request.username, hashed_password=hash_password(request.password))
+        user = User(username=payload.username, hashed_password=hash_password(payload.password))
         session.add(user)
         session.commit()
         session.refresh(user)  # populates user.id, needed below, before commit assigns it
@@ -278,15 +319,19 @@ async def signup(request: SignupRequest) -> TokenResponse:
 
 
 @app.post("/auth/login", response_model=TokenResponse)
-async def login(request: LoginRequest) -> TokenResponse:
+@limiter.limit(LOGIN_RATE_LIMIT)
+async def login(request: Request, payload: LoginRequest) -> TokenResponse:
     """Verify credentials and return a fresh JWT. No password-strength check
     here — those rules only apply when a password is being *set* (signup);
     an existing account must still be able to log in even if the rules
-    change later, since its stored password won't retroactively update."""
+    change later, since its stored password won't retroactively update.
+
+    Rate-limited (Phase 6.2) to blunt password brute-forcing; `request: Request`
+    is required by the limiter, not used by the handler."""
     session = get_session()
     try:
-        user = session.query(User).filter(User.username == request.username).first()
-        if user is None or not verify_password(request.password, user.hashed_password):
+        user = session.query(User).filter(User.username == payload.username).first()
+        if user is None or not verify_password(payload.password, user.hashed_password):
             # Deliberately the same error for "no such user" and "wrong password" —
             # a distinct message would let an attacker enumerate valid usernames.
             raise HTTPException(401, "Incorrect username or password.")
@@ -444,7 +489,12 @@ async def habits_stats(days: int = 30, user_id: int = Depends(get_current_user_i
 
 
 @app.post("/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest, user_id: int = Depends(get_current_user_id)) -> ChatResponse:
+@limiter.limit(CHAT_RATE_LIMIT)
+async def chat(
+    request: Request,
+    payload: ChatRequest,
+    user_id: int = Depends(get_current_user_id),
+) -> ChatResponse:
     """Send one message to the Habit Coach and get its reply.
 
     user_id comes only from the verified JWT (via Depends), never from the
@@ -452,12 +502,15 @@ async def chat(request: ChatRequest, user_id: int = Depends(get_current_user_id)
     to be someone else's thread. It's passed as the LangGraph thread_id,
     which is also what src/tools.py's ToolRuntime reads to scope every tool
     call to the right user's data.
+
+    Rate-limited (Phase 6.2) as a backstop on Anthropic spend; `request:
+    Request` is required by the limiter.
     """
     correlation_id = _new_correlation_id("chat")
     agent = app.state.agent
     logger.info("Chat request received (user_id=%s).", user_id)
     result = await agent.ainvoke(
-        {"messages": [{"role": "user", "content": request.message}]},
+        {"messages": [{"role": "user", "content": payload.message}]},
         config=_agent_config(
             thread_id=str(user_id),
             tags=["web", "chat", "habit-tracking"],
@@ -493,7 +546,10 @@ def _as_text(content: object) -> str:
 
 
 @app.post("/evaluate_friction", response_model=ChatResponse)
-async def evaluate_friction(user_id: int = Depends(get_current_user_id)) -> ChatResponse:
+@limiter.limit(FRICTION_RATE_LIMIT)
+async def evaluate_friction(
+    request: Request, user_id: int = Depends(get_current_user_id)
+) -> ChatResponse:
     """Manually run the same evening 'friction check' the 20:00 scheduler job
     runs automatically (Phase 3): look at what's still pending for THIS user
     and, if anything is, have the coach produce a pattern-aware nudge — same
@@ -503,7 +559,8 @@ async def evaluate_friction(user_id: int = Depends(get_current_user_id)) -> Chat
 
     Like every other endpoint, identity is the JWT's user_id only, never a
     request-body field — reintroducing a client-supplied user_id here would
-    be the exact bug real auth already fixed in /chat.
+    be the exact bug real auth already fixed in /chat. Rate-limited (Phase
+    6.2); `request: Request` is required by the limiter.
     """
     correlation_id = _new_correlation_id("friction")
     reply = await run_friction_nudge(
@@ -595,5 +652,14 @@ async def telegram_webhook(
 if __name__ == "__main__":
     import uvicorn
 
-    # Cloud Run injects PORT; bind all interfaces so the container is reachable.
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+    # Railway/Cloud Run inject PORT; bind all interfaces so the container is
+    # reachable. proxy_headers + forwarded_allow_ips let the rate limiter (Phase
+    # 6.2) key on the real client IP from X-Forwarded-For rather than Railway's
+    # proxy, which would otherwise bucket every caller together.
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 8080)),
+        proxy_headers=True,
+        forwarded_allow_ips="*",
+    )

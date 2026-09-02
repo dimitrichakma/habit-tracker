@@ -29,10 +29,13 @@ dependencies = [
     "python-dotenv>=1.2.3",
     "python-telegram-bot>=20",
     "requests>=2.34.2",
+    "slowapi>=0.1.10",
     "sqlalchemy>=2.0.52",
     "streamlit>=1.62.0",
     "uvicorn>=0.52.4",
 ]
 
 [dependency-groups]
-dev = []
+dev = [
+    "testcontainers[postgres]>=4.15.0",
+]
