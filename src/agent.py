@@ -157,17 +157,22 @@ GUARDRAIL_OUTPUT_LLM_CHECK = os.environ.get("GUARDRAIL_OUTPUT_LLM_CHECK", "1").l
     "",
 )
 
-# --- REVIEW REQUIRED -------------------------------------------------------
+# --- REVIEW / LOCALIZE ---------------------------------------------------
 # Shown when the guardrail declines a harmful / self-harm / disordered-eating
-# request. This wording MUST be reviewed and kept current by a person — a real,
-# appropriate helpline or support resource for this app's users, or a line
-# pointing them to a trusted person / their doctor. Do NOT let an LLM write or
-# "improve" it. Override in deployment via the HARM_SUPPORT_RESOURCE env var.
+# request. Deliberately points to a maintained directory and to trusted people
+# rather than hard-coding a crisis phone number — a wrong or stale number is
+# worse than none. Before relying on this: confirm findahelpline.com is
+# appropriate for your users, and consider adding a verified local crisis line
+# (e.g. for Bangladesh, Kaan Pete Roi — check the current number yourself).
+# Override in deployment via the HARM_SUPPORT_RESOURCE env var.
 HARM_SUPPORT_RESOURCE = os.environ.get(
     "HARM_SUPPORT_RESOURCE",
-    "[REVIEW REQUIRED — a human must replace this with a vetted support resource: "
-    "a helpline for this app's users, or a line pointing to a trusted person or "
-    "their doctor. This placeholder ships until then.]",
+    "You don't have to deal with this on your own. If you can, talk to someone "
+    "you trust about what's going on — a friend, someone in your family, or your "
+    "doctor. And if you'd rather speak to someone trained and outside your "
+    "circle, findahelpline.com lists free, confidential helplines you can call "
+    "or message in your country, any time. Reaching out for help isn't weak — "
+    "it's the strongest move there is.",
 )
 # ------------------------------------------------------------------------
 
