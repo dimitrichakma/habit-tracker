@@ -332,6 +332,38 @@ def test_telegram_blocks_once_budget_exceeded(client):
     assert any("usage limit" in msg["text"] for msg in client.tg.bot.sent)
 
 
+def test_evaluate_friction_records_token_usage(client):
+    """run_friction_nudge (scheduler.py) meters its turn against the ledger —
+    it doesn't go through /chat's gateway but still records worker + Haiku."""
+    session = database.get_session()
+    try:  # a pending habit so the nudge actually invokes the agent
+        session.add(database.Habit(user_id=1, name="Stretch", frequency="daily"))
+        session.commit()
+    finally:
+        session.close()
+
+    resp = client.post("/evaluate_friction", headers=_auth_header(1))
+    assert resp.status_code == 200
+    assert client.agent.calls, "the friction nudge never invoked the agent"
+    assert database.daily_token_total(1, date.today()) == 25  # worker 15 + Haiku 10
+
+
+def test_evaluate_friction_not_blocked_by_budget(client):
+    """The friction path records usage but is NOT gated on MAX_DAILY_QUOTA —
+    the app stays proactive even after the user has chatted past the cap."""
+    database.record_token_usage(1, date.today(), 5000, 5000)  # well over the 1000 cap
+    session = database.get_session()
+    try:
+        session.add(database.Habit(user_id=1, name="Stretch", frequency="daily"))
+        session.commit()
+    finally:
+        session.close()
+
+    resp = client.post("/evaluate_friction", headers=_auth_header(1))
+    assert resp.status_code == 200
+    assert client.agent.calls, "budget block wrongly suppressed the friction nudge"
+
+
 # --- generic error handler --------------------------------------
 
 

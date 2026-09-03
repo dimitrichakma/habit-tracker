@@ -247,9 +247,11 @@
     `user_id` — this was the exact vulnerability already fixed once in
     `/chat`, never reintroduce it here. Runs the same
     pending-habits-then-agent-nudge flow the scheduler runs automatically.
-    Keeps only its IP rate limit — no size cap / masking / budget /
+    Keeps only its IP rate limit — no size cap / masking / budget block /
     timeout (it takes no message body; its agent call is in
-    `scheduler.run_friction_nudge`, out of the gateway's path).
+    `scheduler.run_friction_nudge`, out of the gateway's path). It DOES
+    record token usage against the daily ledger — `run_friction_nudge`
+    does that itself.
   - `POST /webhook/telegram` — **Phase 5**, hardened **Phase 6**. Checks
     `X-Telegram-Bot-Api-Secret-Token` == `WEBHOOK_SECRET_TOKEN` (401),
     parses the `Update`, then a per-`chat_id` in-memory sliding-window
@@ -324,7 +326,11 @@
     and `correlation_id` ride the LangSmith trace tags/metadata so the
     two callers are distinguishable; they never affect the coaching.
     `_environment()` is duplicated here (not imported) — `main` imports
-    this module, so importing back would be circular.
+    this module, so importing back would be circular. It attaches its own
+    `UsageMetadataCallbackHandler` and calls `database.record_token_usage`
+    (best-effort) so this path's worker + Haiku tokens land in the daily
+    ledger — it does NOT check the budget, though: the scheduled nudge
+    stays proactive regardless of the user's chat usage.
 - `src/mcp_server.py` — **Phase 3, standalone learning exercise, NOT
   connected to the production agent.** FastMCP, stdio transport, run
   independently (Claude Desktop, MCP Inspector). Reuses the `tools.py`
@@ -684,11 +690,13 @@
   on an LLM free-text output field — the model overruns it and structured
   parsing throws (this already caused a fail-safe on a good reply once).
 - **The gateway (Phase 6) covers exactly the two agent entry points —
-  `/chat` and the Telegram webhook.** `/evaluate_friction` is out of its
-  path by design. Order at each entry point: rate limit → size cap →
-  PII masking → token budget → timed agent call → record usage. Masking
-  is fail-CLOSED; the rate limiter is fail-OPEN; the budget check is
-  fail-open.
+  `/chat` and the Telegram webhook.** `/evaluate_friction` and the
+  scheduled nudge are out of its path by design (no size cap / masking /
+  budget block / timeout) — but `run_friction_nudge` still *records* its
+  token usage to the ledger. Order at each gateway entry point: rate
+  limit → size cap → PII masking → token budget → timed agent call →
+  record usage. Masking is fail-CLOSED; the rate limiter is fail-OPEN;
+  the budget check is fail-open.
 - **PII masking is `main.mask_pii` (plain `re`) — never add Presidio or
   another NLP dep.** It's applied at the entry point only; raw chat text
   never reaches `summarize_memory` / the embedding path (that's built
@@ -734,11 +742,13 @@
 - The evaluation suite tests agent reasoning over mocked retrieval; the
   real vector-store pipeline is covered separately by `tests/` (Phase 6).
 - The token budget counts raw tokens, not price-weighted — a Haiku token
-  (metered) and a Sonnet token count the same against `MAX_DAILY_QUOTA`
-  even though Haiku is ~½ the price. It's a usage cap, not a spend cap.
-  `run_friction_nudge` (scheduler / `/evaluate_friction`) is still
-  unmetered — it doesn't go through `_invoke_agent`. PII masking is a
-  regex heuristic — it will miss unusual formats and can over-mask an
+  and a Sonnet token count the same against `MAX_DAILY_QUOTA` even though
+  Haiku is ~½ the price. It's a usage cap, not a spend cap. Every agent
+  path now records to the ledger (`/chat`, Telegram webhook via
+  `_invoke_agent`; the scheduled nudge + `/evaluate_friction` via
+  `run_friction_nudge`), but only `/chat` and the webhook are *blocked*
+  on the cap — the friction paths record without blocking. PII masking is
+  a regex heuristic — it will miss unusual formats and can over-mask an
   odd bare 10-15 digit run.
 - **Deployment gaps:** the Streamlit frontend is prepared for Streamlit
   Cloud but not actually deployed. `src/bot.py` is no longer runnable on

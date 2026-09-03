@@ -27,9 +27,10 @@ from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from langchain_core.callbacks import UsageMetadataCallbackHandler
 from telegram import Bot
 
-from .database import Habit, User, get_session, is_due_today, is_satisfied
+from .database import Habit, User, get_session, is_due_today, is_satisfied, record_token_usage
 from .summarize_memory import summarize_user_week
 
 logger = logging.getLogger(__name__)
@@ -135,8 +136,15 @@ async def run_friction_nudge(
     POST /evaluate_friction) and `correlation_id` are recorded on the
     LangSmith trace so the two callers can be told apart in the dashboard
     (Phase 6.1). They never affect the coaching itself.
+
+    Token usage (worker + Haiku guardrail classifiers) IS recorded against
+    the daily budget — this path was unmetered before, so the ledger was
+    incomplete. It's not *blocked* on the budget, though: the scheduled
+    nudge is the app being proactive, and shouldn't go silent because the
+    user chatted a lot today.
     """
-    pending = _pending_habit_names(user_id, date.today())
+    today = date.today()
+    pending = _pending_habit_names(user_id, today)
     if not pending:
         return None
 
@@ -155,6 +163,7 @@ async def run_friction_nudge(
     }
     if correlation_id:
         metadata["correlation_id"] = correlation_id
+    usage_cb = UsageMetadataCallbackHandler()
     result = await agent.ainvoke(
         {"messages": [{"role": "user", "content": trigger}]},
         config={
@@ -162,8 +171,23 @@ async def run_friction_nudge(
             "tags": ["friction-check", origin, "habit-tracking"],
             "metadata": metadata,
             "run_name": f"friction_nudge:{origin}",
+            "callbacks": [usage_cb],
         },
     )
+
+    # Record, don't block — sum every model the turn ran (worker + Haiku
+    # classifiers). Best-effort: a ledger write failure must not sink the nudge.
+    try:
+        per_model = usage_cb.usage_metadata.values()
+        record_token_usage(
+            user_id,
+            today,
+            sum(m.get("input_tokens", 0) or 0 for m in per_model),
+            sum(m.get("output_tokens", 0) or 0 for m in per_model),
+        )
+    except Exception:
+        logger.warning("Could not record friction-nudge token usage.", exc_info=True)
+
     return _reply_text(result["messages"][-1].content) or f"Still pending today: {listed}."
 
 
