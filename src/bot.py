@@ -54,9 +54,16 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     try:
         reply = await on_message(update.message.text)
-    except Exception as exc:  # report the failure to the user — never crash silently
+    except Exception:  # generic reply only — the real error is logged server-side
+        # `on_message` (main._telegram_reply) already returns a plain string for
+        # every user-facing case (oversized / masking / budget / timeout). This
+        # is the backstop for the unexpected: never echo `exc` to the user — it
+        # can carry a DB error string or the "no account for
+        # HABIT_TRACKER_USERNAME=<name>" RuntimeError.
         logger.exception("Failed to handle a Telegram message.")
-        await update.message.reply_text(f"⚠️ Sorry, something went wrong: {exc}")
+        await update.message.reply_text(
+            "⚠️ Something went wrong on my end. Please try again in a moment."
+        )
         return
     await update.message.reply_text(reply)
 

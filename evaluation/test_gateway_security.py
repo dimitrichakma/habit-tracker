@@ -330,6 +330,41 @@ def test_internal_error_is_generic_not_leaked(client):
     assert resp.json()["detail"] == "Something went wrong on our end. Please try again."
 
 
+async def test_bot_handler_does_not_leak_exception_text():
+    """src/bot.py's _handle_message backstop: an unexpected error from the
+    on_message callback gets a generic reply, never the exception string (which
+    can carry a DB error or the HABIT_TRACKER_USERNAME RuntimeError)."""
+    import src.bot as bot
+
+    sent: list[str] = []
+
+    async def _boom(_text: str) -> str:
+        raise RuntimeError("No account for HABIT_TRACKER_USERNAME='secret_account'")
+
+    class _Msg:
+        text = "hey coach"
+
+        async def reply_text(self, text: str) -> None:
+            sent.append(text)
+
+    class _Update:
+        message = _Msg()
+        effective_chat = None  # skips the send_chat_action branch
+
+    class _App:
+        bot_data = {"on_message": _boom}
+
+    class _Ctx:
+        application = _App()
+
+    await bot._handle_message(_Update(), _Ctx())
+
+    assert sent, "the handler sent no reply"
+    assert "secret_account" not in sent[0]
+    assert "RuntimeError" not in sent[0]
+    assert "went wrong on my end" in sent[0]
+
+
 # --- agent timeout ---------------------------------------------
 
 

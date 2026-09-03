@@ -297,7 +297,10 @@
   Still no LangChain/LangGraph/DB imports — `main.py` injects the
   agent-calling callback (`_telegram_reply`). The old `BackendClient` /
   `/auth/login` / proactive-JWT-refresh machinery is gone (it only
-  existed because the bot was a separate HTTP client).
+  existed because the bot was a separate HTTP client). `_handle_message`'s
+  `except` block replies with a **generic** message and logs the real
+  exception server-side — never echoes `exc` (it can carry a DB error
+  string or the `HABIT_TRACKER_USERNAME` `RuntimeError`).
 - `src/scheduler.py` — **Phase 2/3/4**, unchanged in Phase 5. Runs
   in-process with FastAPI
   (trusted context — may import `database.py` directly, unlike `bot.py`).
@@ -724,13 +727,6 @@
   `[project.dependencies]`, so `uv sync --no-dev` in the `Dockerfile`
   doesn't drop them — the Railway image carries them (harmless bloat).
   `testcontainers` is correctly in `[dependency-groups] dev`.
-- **`src/bot.py` still echoes exception text to the Telegram user**
-  (`"⚠️ Sorry, something went wrong: {exc}"`). `_telegram_reply` no
-  longer raises for gateway-handled cases (size / masking / budget /
-  timeout all return strings), but an unexpected error (or the
-  "no account for HABIT_TRACKER_USERNAME" `RuntimeError`) still leaks
-  through `bot.py`. `bot.py` was out of scope for the Phase 6 gateway
-  work — a small follow-up.
 - The token budget counts only the worker model (`claude-sonnet-5`); the
   Haiku guardrail classifier's tokens are not metered. PII masking is a
   regex heuristic — it will miss unusual formats and can over-mask an
