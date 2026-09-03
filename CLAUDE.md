@@ -266,6 +266,19 @@
     (`MAX_DAILY_QUOTA`, 429). Agent call is wrapped by `_invoke_agent`
     (timeout → `AGENT_UNAVAILABLE_MESSAGE`); token usage recorded after
     via `BackgroundTasks`.
+  - `POST /chat/stream` — same request/identity/gateway checks as `/chat`,
+    but the reply is streamed as **Server-Sent Events** (`_stream_agent`
+    drives `agent.astream_events(version="v2")`). Frames: `status` (a
+    friendly line per tool, from `_TOOL_STATUS`), `token` (worker reply
+    text as it generates — Haiku classifier chunks filtered out by
+    `ls_model_name`), `replace` (a turn that produced no streamed text —
+    an input-guardrail block — or one the **output guardrail swapped**,
+    detected from `response_metadata["guardrail"]["stage"] == "output"`),
+    then `done`. Wall-clock cap `AGENT_STREAM_TIMEOUT_SECONDS` (90, higher
+    than the blocking cap). Never raises mid-stream — failures degrade to
+    a `replace`/`error` frame. Token usage recorded via a response
+    `BackgroundTask` after the stream closes. The blocking `/chat` stays
+    (Telegram path + eval suites); only `src/app.py` uses `/chat/stream`.
   - `GET /habits/today`, `GET /habits/stats?days=N`, `GET /chat/history`
     — all auth-required, scoped to caller's `user_id`.
   - `POST /evaluate_friction` — **Phase 3**. Manual trigger for testing,
@@ -325,7 +338,13 @@
   app secrets). Login/signup gate, JWT in `st.session_state` only. Drops
   to login on `401`. Chat tab + Progress tab (Plotly trend/heatmap, KPI row).
   **Phase 6**: the signup form has a "Signup code" field sent as the
-  `X-Signup-Secret` header (matches `auth.require_signup_allowed`).
+  `X-Signup-Secret` header (matches `auth.require_signup_allowed`). The chat
+  tab calls `POST /chat/stream` via `stream_reply()` — a hand-rolled SSE
+  reader (`requests` `stream=True` + `iter_lines`) that updates two
+  `st.empty()` placeholders live: a status caption while tools run, then the
+  reply typed out token-by-token. Still HTTP-only; `stream_reply` mirrors
+  `authed_request`'s 401 → login-screen behaviour. `CHAT_URL` (blocking)
+  is kept as a one-line revert path.
 - `src/bot.py` — **Phase 2, rewritten Phase 5.** A module, NOT a process —
   no polling, no `__main__`. `build_application(on_message)` builds the
   `python-telegram-bot` `Application` + handlers and stashes the
@@ -629,7 +648,8 @@
     (slowapi strings), `TELEGRAM_RATE_LIMIT_PER_MIN` (int). `MAX_MESSAGE_CHARS`
     (1000), `MAX_DAILY_QUOTA` (default 200000 tokens/user/day — **raised to
     1000000 on Railway** after a months-old thread hit the default in ~3
-    turns; see `MAX_HISTORY_TOKENS`), `AGENT_TIMEOUT_SECONDS` (30).
+    turns; see `MAX_HISTORY_TOKENS`), `AGENT_TIMEOUT_SECONDS` (30, blocking
+    `/chat` + Telegram), `AGENT_STREAM_TIMEOUT_SECONDS` (90, `/chat/stream`).
     `GUARDRAIL_TIMEOUT_SECONDS` (8), `GUARDRAIL_OUTPUT_LLM_CHECK` (on),
     `OFF_TOPIC_BLOCK_CONFIDENCE` (0.85) — min classifier confidence to
     hard-block an OffTopic input; below it the coach redirects it itself.
@@ -732,14 +752,19 @@
   block at any confidence. Keep that asymmetry: an off-topic message
   reaching the coach is harmless (it redirects); a blocked habit update
   frustrates the one user.
-- **The gateway (Phase 6) covers exactly the two agent entry points —
-  `/chat` and the Telegram webhook.** `/evaluate_friction` and the
-  scheduled nudge are out of its path by design (no size cap / masking /
-  budget block / timeout) — but `run_friction_nudge` still *records* its
-  token usage to the ledger. Order at each gateway entry point: rate
-  limit → size cap → PII masking → token budget → timed agent call →
-  record usage. Masking is fail-CLOSED; the rate limiter is fail-OPEN;
-  the budget check is fail-open.
+- **The gateway (Phase 6) covers the agent entry points — `/chat`,
+  `/chat/stream`, and the Telegram webhook.** `/chat/stream` runs the same
+  checks in the same order before the SSE stream opens (they raise
+  `HTTPException` pre-stream, which serializes fine). `/evaluate_friction`
+  and the scheduled nudge are out of its path by design (no size cap /
+  masking / budget block / timeout) — but `run_friction_nudge` still
+  *records* its token usage to the ledger. Order at each gateway entry
+  point: rate limit → size cap → PII masking → token budget → timed agent
+  call → record usage. Masking is fail-CLOSED; the rate limiter is
+  fail-OPEN; the budget check is fail-open. `/chat/stream`'s agent call
+  never raises mid-stream (a failure becomes a `replace`/`error` frame),
+  and it records usage via a response `BackgroundTask` once the stream
+  closes rather than `BackgroundTasks`.
 - **PII masking is `main.mask_pii` (plain `re`) — never add Presidio or
   another NLP dep.** It's applied at the entry point only; raw chat text
   never reaches `summarize_memory` / the embedding path (that's built
@@ -812,4 +837,13 @@
   deployment env vars). On a deployment it's gated by `SIGNUP_SECRET`, and
   if that var is missing it fails CLOSED rather than open — see
   `auth.require_signup_allowed`.
+- `POST /chat/stream` shows worker tokens as they generate, so the
+  **output guardrail runs after the user has already seen them**. When it
+  fires, `_stream_agent` sends a `replace` frame and `src/app.py` swaps the
+  visible text — a brief flash, not a silent leak. The regex half of the
+  output guardrail (leak / prescription patterns) is the only part that
+  could have caught something pre-generation anyway; the deterministic
+  input checks and the whole Telegram path are unaffected. Accepted for a
+  single-user app; a stricter build would buffer-then-verify (losing the
+  latency win) instead.
 

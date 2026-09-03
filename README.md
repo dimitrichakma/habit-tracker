@@ -105,7 +105,10 @@ Streamlit Cloud            Telegram  --webhook-->  ┌────────�
   call in the app). Migrated from ChromaDB in Phase 5 without touching the
   agent or the tests.
 - **Streamlit** - chat UI, Today's Dashboard, and Plotly progress charts.
-  HTTP-only; reads its backend URL from `BACKEND_BASE_URL`.
+  HTTP-only; reads its backend URL from `BACKEND_BASE_URL`. The chat replies
+  stream in over Server-Sent Events (`POST /chat/stream`) with a status line
+  ("Checking what's still pending…") while the coach runs its tools, so the
+  wait shows progress instead of a frozen spinner.
 - **python-telegram-bot + APScheduler** - the bot runs *inside* the backend
   process now (a webhook, not a polling process). One scheduler, two jobs:
   the daily 8pm reminder / friction check and the Sunday-night weekly summary.

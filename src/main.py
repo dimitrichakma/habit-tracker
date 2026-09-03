@@ -1,6 +1,7 @@
 """FastAPI service exposing the habit coaching agent over HTTP."""
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -14,13 +15,14 @@ from datetime import date, timedelta
 
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from langchain_core.callbacks import UsageMetadataCallbackHandler
 from langchain_core.messages import AIMessage, HumanMessage
 from pydantic import BaseModel, Field
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
+from starlette.background import BackgroundTask
 from telegram import Update
 
 load_dotenv()
@@ -167,6 +169,10 @@ MAX_DAILY_QUOTA = int(os.environ.get("MAX_DAILY_QUOTA", "200000"))
 # and the (partially checkpointed) run is abandoned — the next turn resumes from
 # the last node boundary.
 AGENT_TIMEOUT_SECONDS = float(os.environ.get("AGENT_TIMEOUT_SECONDS", "30"))
+# Wall-clock cap on a streamed turn (POST /chat/stream). Higher than the
+# blocking cap: tokens are already flowing, so a slow-but-progressing reply
+# isn't a stuck request.
+AGENT_STREAM_TIMEOUT_SECONDS = float(os.environ.get("AGENT_STREAM_TIMEOUT_SECONDS", "90"))
 # Telegram webhook: messages per chat_id per rolling 60s.
 TELEGRAM_RATE_LIMIT_PER_MIN = int(os.environ.get("TELEGRAM_RATE_LIMIT_PER_MIN", "5"))
 
@@ -790,6 +796,147 @@ def _as_text(content: object) -> str:
             block.get("text", "") for block in content if isinstance(block, dict) and block.get("type") == "text"
         )
     return ""
+
+
+# --- Streaming chat (perceived-latency work) ----------------------------
+# POST /chat/stream is POST /chat with the reply delivered as Server-Sent
+# Events instead of one JSON blob: "status" frames name the tool the coach is
+# running, "token" frames carry the reply as it's generated, then "done".
+# The blocking POST /chat stays — the Telegram path and the eval suites drive
+# the same agent but not this endpoint. The same gateway checks run up front;
+# the guardrails still run inside the graph, so a reply the output guardrail
+# swaps arrives as a "replace" frame after the tokens.
+
+# tool name -> the status line the web UI shows while it runs.
+_TOOL_STATUS = {
+    "get_pending_habits": "Checking what's still pending…",
+    "list_habits": "Looking up your habits…",
+    "log_habit": "Logging that…",
+    "create_new_habit": "Setting up the habit…",
+    "delete_habit": "Updating your habits…",
+    "get_weekly_summary": "Reviewing your week…",
+    "get_habit_history_pattern": "Checking your history for a pattern…",
+    "query_past_behavior": "Recalling how past weeks went…",
+}
+
+
+def _sse(event: dict) -> str:
+    return f"data: {json.dumps(event)}\n\n"
+
+
+async def _stream_agent(
+    message: str, config: dict, usage_cb: UsageMetadataCallbackHandler
+):
+    """Yield SSE frames for one agent turn. Never raises — any failure is
+    emitted as an "error"/"replace" frame so a half-sent response degrades to
+    a message, not a broken connection."""
+    cfg = {**config, "callbacks": [*config.get("callbacks", []), usage_cb]}
+    root_run_id = None
+    streamed = False
+    try:
+        async with asyncio.timeout(AGENT_STREAM_TIMEOUT_SECONDS):
+            async for event in app.state.agent.astream_events(
+                {"messages": [{"role": "user", "content": message}]},
+                config=cfg,
+                version="v2",
+            ):
+                if root_run_id is None:
+                    root_run_id = event.get("run_id")
+                kind = event["event"]
+
+                if kind == "on_tool_start":
+                    label = _TOOL_STATUS.get(event.get("name", ""), "Working on it…")
+                    yield _sse({"type": "status", "text": label})
+
+                elif kind == "on_chat_model_stream":
+                    model = (event.get("metadata") or {}).get("ls_model_name", "")
+                    if "haiku" in model.lower():
+                        continue  # the guardrail classifier, not the coach
+                    piece = _as_text(event["data"]["chunk"].content)
+                    if piece:
+                        streamed = True
+                        yield _sse({"type": "token", "text": piece})
+
+                elif kind == "on_chain_end" and event.get("run_id") == root_run_id:
+                    messages = (event["data"].get("output") or {}).get("messages") or []
+                    if not messages:
+                        break
+                    last = messages[-1]
+                    final_text = _as_text(last.content)
+                    guardrail = (getattr(last, "response_metadata", None) or {}).get("guardrail")
+                    if guardrail and guardrail.get("stage") == "output":
+                        # output guardrail swapped the reply after it generated
+                        yield _sse({"type": "replace", "text": final_text})
+                    elif not streamed:
+                        # input guardrail block, or a turn with no streamed text
+                        yield _sse({"type": "replace", "text": final_text})
+        yield _sse({"type": "done"})
+    except (asyncio.TimeoutError, TimeoutError):
+        logger.warning("Streaming agent turn exceeded %.0fs.", AGENT_STREAM_TIMEOUT_SECONDS)
+        if streamed:
+            yield _sse({"type": "error", "text": "\n\n_(cut off — that took longer than expected)_"})
+        else:
+            yield _sse({"type": "replace", "text": AGENT_UNAVAILABLE_MESSAGE})
+        yield _sse({"type": "done"})
+    except Exception:
+        logger.exception("Streaming agent turn failed.")
+        yield _sse({"type": "replace", "text": AGENT_UNAVAILABLE_MESSAGE})
+        yield _sse({"type": "done"})
+
+
+@app.post("/chat/stream")
+@limiter.limit(CHAT_RATE_LIMIT, key_func=_user_id_rate_key)
+async def chat_stream(
+    request: Request,
+    payload: ChatRequest,
+    user_id: int = Depends(_rate_limit_user_id),
+) -> StreamingResponse:
+    """POST /chat, streamed as Server-Sent Events (see _stream_agent). Same
+    gateway checks run before the stream opens; token usage is recorded once
+    the stream finishes, via a response BackgroundTask."""
+    correlation_id = _new_correlation_id("chat")
+    if len(payload.message) > MAX_MESSAGE_CHARS:
+        raise HTTPException(
+            413,
+            f"Please keep your message under {MAX_MESSAGE_CHARS} characters — "
+            "send it in a couple of shorter messages.",
+        )
+    try:
+        message = mask_pii(payload.message)
+    except Exception:
+        logger.warning("PII masking failed — blocking the request (fail-closed).", exc_info=True)
+        raise HTTPException(500, "Something went wrong on our end. Please try again.") from None
+
+    if _budget_exceeded(user_id):
+        raise HTTPException(429, "You've reached today's usage limit. Please try again tomorrow.")
+
+    usage_cb = UsageMetadataCallbackHandler()
+    config = _agent_config(
+        thread_id=str(user_id),
+        tags=["web", "chat", "habit-tracking", "streamed"],
+        metadata={
+            "user_id": user_id,
+            "correlation_id": correlation_id,
+            "environment": _environment(),
+            "source": "web",
+        },
+        run_name="web_chat",
+    )
+
+    def _record_usage() -> None:
+        per_model = usage_cb.usage_metadata.values()
+        inp = sum(m.get("input_tokens", 0) or 0 for m in per_model)
+        out = sum(m.get("output_tokens", 0) or 0 for m in per_model)
+        if inp or out:
+            record_token_usage(user_id, date.today(), inp, out)
+
+    logger.info("Streaming chat request received (user_id=%s).", user_id)
+    return StreamingResponse(
+        _stream_agent(message, config, usage_cb),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        background=BackgroundTask(_record_usage),
+    )
 
 
 @app.post("/evaluate_friction", response_model=ChatResponse)

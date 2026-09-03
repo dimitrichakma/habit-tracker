@@ -1,5 +1,6 @@
 """Streamlit chat frontend for the Habit Tracker. HTTP calls only — no agent logic here."""
 
+import json
 import os
 import re
 
@@ -36,6 +37,7 @@ BACKEND_BASE_URL = os.environ.get("BACKEND_BASE_URL", "http://localhost:8000").r
 SIGNUP_URL = f"{BACKEND_BASE_URL}/auth/signup"
 LOGIN_URL = f"{BACKEND_BASE_URL}/auth/login"
 CHAT_URL = f"{BACKEND_BASE_URL}/chat"
+CHAT_STREAM_URL = f"{BACKEND_BASE_URL}/chat/stream"
 TODAY_URL = f"{BACKEND_BASE_URL}/habits/today"
 HISTORY_URL = f"{BACKEND_BASE_URL}/chat/history"
 STATS_URL = f"{BACKEND_BASE_URL}/habits/stats"
@@ -66,6 +68,64 @@ def authed_request(method: str, url: str, **kwargs):
         st.rerun()
     response.raise_for_status()
     return response
+
+
+def stream_reply(prompt: str) -> str:
+    """POST to /chat/stream and render the Server-Sent Events live: a status
+    caption while the coach runs its tools, then the reply typed out token by
+    token. Returns the final reply text so the caller can store it in the
+    visible history. Mirrors authed_request's 401 -> login-screen behaviour."""
+    status_ph = st.empty()
+    reply_ph = st.empty()
+    status_ph.caption("💭 Thinking…")
+    acc = ""
+    try:
+        response = requests.post(
+            CHAT_STREAM_URL,
+            json={"message": prompt},
+            headers=auth_headers(),
+            stream=True,
+            timeout=(10, 120),
+        )
+        if response.status_code == 401:
+            st.session_state.clear()
+            st.warning("Session expired — please log in again.")
+            st.rerun()
+        if response.status_code != 200:
+            try:
+                detail = response.json().get("detail", "the backend rejected the request")
+            except ValueError:
+                detail = f"the backend returned {response.status_code}"
+            status_ph.empty()
+            reply_ph.markdown(f"⚠️ {detail}")
+            return f"⚠️ {detail}"
+
+        for raw in response.iter_lines(decode_unicode=True):
+            if not raw or not raw.startswith("data: "):
+                continue
+            event = json.loads(raw[6:])
+            etype = event.get("type")
+            if etype == "status":
+                status_ph.caption(f"🔎 {event['text']}")
+            elif etype == "token":
+                status_ph.empty()
+                acc += event["text"]
+                reply_ph.markdown(acc + " ▌")
+            elif etype == "replace":
+                status_ph.empty()
+                acc = event["text"]
+                reply_ph.markdown(acc)
+            elif etype == "error":
+                acc += event["text"]
+                reply_ph.markdown(acc)
+            elif etype == "done":
+                break
+    except requests.RequestException as exc:
+        acc = acc or f"Could not reach the habit tracker backend: {exc}"
+
+    status_ph.empty()
+    reply_ph.markdown(acc or "_(no reply)_")
+    return acc or "_(no reply)_"
 
 
 def render_progress_tab() -> None:
@@ -304,14 +364,7 @@ with chat_tab:
             st.markdown(prompt)
 
         with st.chat_message("assistant"):
-            with st.spinner("Coaching…"):
-                try:
-                    response = authed_request("POST", CHAT_URL, json={"message": prompt}, timeout=60)
-                    reply = response.json()["reply"]
-                except requests.RequestException as exc:
-                    reply = f"Could not reach the habit tracker backend: {exc}"
-
-            st.markdown(reply)
+            reply = stream_reply(prompt)
 
         st.session_state.messages.append({"role": "assistant", "content": reply})
         # Re-run so the sidebar dashboard re-fetches with the state this message just changed.
