@@ -116,8 +116,10 @@
     daily token-budget ledger. `daily_token_total(user_id, day)` sums it
     (0 when no row — that IS the per-calendar-day reset);
     `record_token_usage(...)` increments it (called post-reply from a
-    `BackgroundTask`). Only the worker model's `usage_metadata` is
-    counted — the Haiku guardrail classifier's tokens are not.
+    `BackgroundTask`). Counts **every** model call the turn made — the
+    `claude-sonnet-5` worker AND both Haiku guardrail classifier calls —
+    summed by a `UsageMetadataCallbackHandler` in `_invoke_agent` (raw token
+    counts, not price-weighted).
   - `frequency`/`status` are free text, not enums.
   - `init_db()` additive/idempotent, never drops data — `create_all`
     picks up `token_usage` on the next startup. On Postgres it runs
@@ -266,10 +268,11 @@
   - **Gateway helpers** (`# AI gateway & infrastructure security` +
     `# Rate limiting` sections): `mask_pii` (email / phone / Luhn-checked
     card regex → `<EMAIL_MASKED>` etc.), `_telegram_rate_ok`,
-    `_budget_exceeded`, `_turn_token_usage` (sums `usage_metadata` for
-    messages after the last `HumanMessage` — `ainvoke` returns the whole
-    history), `_invoke_agent` (`asyncio.wait_for` on the agent call),
-    `_AgentUnavailable`. `limiter = Limiter(key_func=get_remote_address,
+    `_budget_exceeded`, `_invoke_agent` (`asyncio.wait_for` on the agent
+    call; attaches a `UsageMetadataCallbackHandler` and returns
+    `(result, (input_tokens, output_tokens))` totalled across every model
+    the turn ran — worker + Haiku classifiers), `_AgentUnavailable`.
+    `limiter = Limiter(key_func=get_remote_address,
     swallow_errors=True)` (fail-open); `@limiter.limit` on the four
     routes with env-configurable limits (`LOGIN_/SIGNUP_/CHAT_/
     FRICTION_RATE_LIMIT`); `@app.exception_handler(Exception)` →
@@ -691,9 +694,11 @@
   never reaches `summarize_memory` / the embedding path (that's built
   from `HabitLog` rows, and habit names the agent creates are already
   masked). `vector_store.py` / `summarize_memory.py` need no masking.
-- **`_turn_token_usage` sums `usage_metadata` only for messages after the
-  last `HumanMessage`** — `agent.ainvoke` returns the whole accumulated
-  history; summing all of it re-counts every prior turn.
+- **Turn token usage comes from a `UsageMetadataCallbackHandler`** attached
+  in `_invoke_agent`, not from slicing `result["messages"]` — the callback
+  is the only way to see the Haiku classifier calls (they live in `agent.py`
+  middleware, never in the returned message list) and it's already scoped to
+  the single `ainvoke`, so no "messages after the last HumanMessage" heuristic.
 - **LangSmith calls are best-effort and wrapped** — `get_current_run_tree()`,
   `@traceable`, tag adds all sit in try/except or are pure dict-building.
   A tracing failure must never fail a user request. Test suites that
@@ -728,8 +733,11 @@
   only safeguards are the ones listed above.
 - The evaluation suite tests agent reasoning over mocked retrieval; the
   real vector-store pipeline is covered separately by `tests/` (Phase 6).
-- The token budget counts only the worker model (`claude-sonnet-5`); the
-  Haiku guardrail classifier's tokens are not metered. PII masking is a
+- The token budget counts raw tokens, not price-weighted — a Haiku token
+  (metered) and a Sonnet token count the same against `MAX_DAILY_QUOTA`
+  even though Haiku is ~½ the price. It's a usage cap, not a spend cap.
+  `run_friction_nudge` (scheduler / `/evaluate_friction`) is still
+  unmetered — it doesn't go through `_invoke_agent`. PII masking is a
   regex heuristic — it will miss unusual formats and can over-mask an
   odd bare 10-15 digit run.
 - **Deployment gaps:** the Streamlit frontend is prepared for Streamlit

@@ -88,8 +88,28 @@ class _FakeAgent:
         self.reply = "Here's your habit update."
         self.delay = 0.0
         self.exc: Exception | None = None
-        self.input_tokens = 10
-        self.output_tokens = 5
+        # per-model token usage this fake "spends" — worker + a stand-in for the
+        # Haiku guardrail classifier, to prove _invoke_agent sums across models.
+        self.model_usage = {
+            "claude-sonnet-5": {"input_tokens": 10, "output_tokens": 5},
+            "claude-haiku-4-5-20251001": {"input_tokens": 8, "output_tokens": 2},
+        }
+
+    def _feed_usage_callbacks(self, config):
+        """Drive any UsageMetadataCallbackHandler in the config the way real
+        model calls would (via on_llm_end), once per model."""
+        from langchain_core.outputs import ChatGeneration, LLMResult
+
+        for cb in (config or {}).get("callbacks", []) or []:
+            if not hasattr(cb, "on_llm_end"):
+                continue
+            for model_name, usage in self.model_usage.items():
+                msg = AIMessage(
+                    content="",
+                    usage_metadata={**usage, "total_tokens": usage["input_tokens"] + usage["output_tokens"]},
+                    response_metadata={"model_name": model_name},
+                )
+                cb.on_llm_end(LLMResult(generations=[[ChatGeneration(message=msg)]]))
 
     async def ainvoke(self, payload, config=None):
         self.calls.append({"payload": payload, "config": config})
@@ -97,18 +117,12 @@ class _FakeAgent:
             await asyncio.sleep(self.delay)
         if self.exc is not None:
             raise self.exc
+        self._feed_usage_callbacks(config)
         user_text = payload["messages"][-1]["content"]
         return {
             "messages": [
                 HumanMessage(content=user_text),
-                AIMessage(
-                    content=self.reply,
-                    usage_metadata={
-                        "input_tokens": self.input_tokens,
-                        "output_tokens": self.output_tokens,
-                        "total_tokens": self.input_tokens + self.output_tokens,
-                    },
-                ),
+                AIMessage(content=self.reply),
             ]
         }
 
@@ -305,8 +319,9 @@ def test_chat_blocks_once_budget_exceeded(client):
 def test_chat_records_token_usage_after_reply(client):
     resp = client.post("/chat", json={"message": "hi"}, headers=_auth_header(1))
     assert resp.status_code == 200
-    # _FakeAgent reports 10 input + 5 output for the turn
-    assert database.daily_token_total(1, date.today()) == 15
+    # _FakeAgent spends 10+5 on the worker and 8+2 on the Haiku classifier;
+    # the budget meters both -> 25.
+    assert database.daily_token_total(1, date.today()) == 25
 
 
 def test_telegram_blocks_once_budget_exceeded(client):

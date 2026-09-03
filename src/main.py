@@ -15,6 +15,7 @@ from datetime import date, timedelta
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
+from langchain_core.callbacks import UsageMetadataCallbackHandler
 from langchain_core.messages import AIMessage, HumanMessage
 from pydantic import BaseModel, Field
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -274,38 +275,38 @@ def _budget_exceeded(user_id: int) -> bool:
         return False
 
 
-def _turn_token_usage(messages: list) -> tuple[int, int]:
-    """(input, output) worker-model tokens for THIS turn only — the messages
-    after the last HumanMessage. agent.ainvoke returns the full accumulated
-    history, so summing the whole list would re-count every prior turn."""
-    last_human = -1
-    for i, message in enumerate(messages):
-        if isinstance(message, HumanMessage):
-            last_human = i
-    inp = out = 0
-    for message in messages[last_human + 1:]:
-        usage = getattr(message, "usage_metadata", None)
-        if usage:
-            inp += usage.get("input_tokens", 0) or 0
-            out += usage.get("output_tokens", 0) or 0
-    return inp, out
+async def _invoke_agent(message_text: str, config: dict) -> tuple[dict, tuple[int, int]]:
+    """One agent turn with a hard timeout (AGENT_TIMEOUT_SECONDS). Returns
+    `(result, (input_tokens, output_tokens))`.
 
+    The token totals cover EVERY model call the turn made — the worker
+    (`claude-sonnet-5`) AND the Haiku guardrail classifiers — via a
+    `UsageMetadataCallbackHandler` scoped to this one invocation. That's why
+    the count comes from the callback, not from slicing `result["messages"]`
+    (which only carries the worker's messages).
 
-async def _invoke_agent(message_text: str, config: dict) -> dict:
-    """One agent turn with a hard timeout (AGENT_TIMEOUT_SECONDS). Raises
-    _AgentUnavailable on timeout; other errors (Anthropic API failures included)
-    propagate to the generic exception handler."""
+    Raises `_AgentUnavailable` on timeout; other errors (Anthropic API
+    failures included) propagate to the generic exception handler."""
+    usage_cb = UsageMetadataCallbackHandler()
+    cfg = {**config, "callbacks": [*config.get("callbacks", []), usage_cb]}
     try:
-        return await asyncio.wait_for(
+        result = await asyncio.wait_for(
             app.state.agent.ainvoke(
                 {"messages": [{"role": "user", "content": message_text}]},
-                config=config,
+                config=cfg,
             ),
             timeout=AGENT_TIMEOUT_SECONDS,
         )
     except (asyncio.TimeoutError, TimeoutError):
         logger.warning("Agent invocation timed out after %.0fs.", AGENT_TIMEOUT_SECONDS)
         raise _AgentUnavailable from None
+
+    # usage_metadata is {model_name: {input_tokens, output_tokens, ...}} — sum
+    # across every model that ran this turn (worker + Haiku classifiers).
+    per_model = usage_cb.usage_metadata.values()
+    inp = sum(m.get("input_tokens", 0) or 0 for m in per_model)
+    out = sum(m.get("output_tokens", 0) or 0 for m in per_model)
+    return result, (inp, out)
 
 
 async def _telegram_reply(message_text: str) -> str:
@@ -359,11 +360,10 @@ async def _telegram_reply(message_text: str) -> str:
         run_name="telegram_chat",
     )
     try:
-        result = await _invoke_agent(message_text, config)
+        result, (inp, out) = await _invoke_agent(message_text, config)
     except _AgentUnavailable:
         return AGENT_UNAVAILABLE_MESSAGE
 
-    inp, out = _turn_token_usage(result["messages"])
     background_tasks = update_ctx.get("background_tasks")
     if background_tasks is not None:
         background_tasks.add_task(record_token_usage, user_id, date.today(), inp, out)
@@ -751,7 +751,7 @@ async def chat(
 
     logger.info("Chat request received (user_id=%s).", user_id)
     try:
-        result = await _invoke_agent(
+        result, (inp, out) = await _invoke_agent(
             message,
             _agent_config(
                 thread_id=str(user_id),
@@ -768,7 +768,6 @@ async def chat(
     except _AgentUnavailable:
         return ChatResponse(reply=AGENT_UNAVAILABLE_MESSAGE)
 
-    inp, out = _turn_token_usage(result["messages"])
     background_tasks.add_task(record_token_usage, user_id, date.today(), inp, out)
 
     # .content is a plain string for a simple reply, but a list of blocks
