@@ -957,9 +957,16 @@ async def evaluate_friction(
     6.2); `request: Request` is required by the limiter.
     """
     correlation_id = _new_correlation_id("friction")
-    reply = await run_friction_nudge(
-        app.state.agent, user_id, origin="manual-trigger", correlation_id=correlation_id
-    )
+    try:
+        reply = await asyncio.wait_for(
+            run_friction_nudge(
+                app.state.agent, user_id, origin="manual-trigger", correlation_id=correlation_id
+            ),
+            timeout=AGENT_TIMEOUT_SECONDS,
+        )
+    except (asyncio.TimeoutError, TimeoutError):
+        logger.warning("Manual friction nudge timed out after %.0fs.", AGENT_TIMEOUT_SECONDS)
+        return ChatResponse(reply=AGENT_UNAVAILABLE_MESSAGE)
     if reply is None:
         return ChatResponse(reply="Nothing pending right now — you're all caught up for today.")
     return ChatResponse(reply=reply)

@@ -18,8 +18,19 @@ def _current_user_id(runtime: ToolRuntime) -> int:
     main.py set from a verified JWT. NEVER accept a user/user_id argument
     from the LLM itself for this purpose — an LLM-suppliable argument is
     trivially spoofable via prompt injection ("pretend I'm user 1").
+
+    Chat / Telegram / eval threads are a bare numeric id. The scheduled
+    friction nudge runs on a throwaway thread `friction-<user_id>-<nonce>`
+    (so it doesn't drag the whole conversation history) — pull the id out
+    of that too, from a fixed position, never from anything the model said.
     """
-    return int(runtime.config["configurable"]["thread_id"])
+    raw = str(runtime.config["configurable"]["thread_id"])
+    if raw.isdigit():
+        return int(raw)
+    for part in raw.split("-"):
+        if part.isdigit():
+            return int(part)
+    raise ValueError(f"cannot resolve a user id from thread_id {raw!r}")
 
 
 def _resolve_log_date(log_date: str) -> date | None:
@@ -215,6 +226,88 @@ def get_weekly_summary(*, runtime: ToolRuntime) -> str:
         session.close()
 
 
+def describe_habit_pattern(habit: Habit, today: date) -> str:
+    """Plain-text six-week recurring-failure summary for one habit. Pure: no
+    DB session opened, no user resolution — `habit.logs` must already be
+    loadable (call inside an open session). Shared by the
+    get_habit_history_pattern tool AND scheduler.run_friction_nudge, which
+    pre-computes this so the evening nudge needs zero tool round trips."""
+    window_start = today - timedelta(days=_PATTERN_LOOKBACK_DAYS - 1)
+    done_dates = {
+        log.date
+        for log in habit.logs
+        if log.status == "done" and window_start <= log.date <= today
+    }
+
+    # Weekly habits: "days of the week" don't apply — report satisfied-or-not
+    # per trailing week instead, matching get_weekly_summary's treatment.
+    if satisfaction_window_days(habit.frequency) >= 7:
+        satisfied_weeks = sum(
+            1
+            for offset in range(6)
+            if done_dates
+            & {today - timedelta(days=7 * offset + d) for d in range(7)}
+        )
+        if satisfied_weeks >= 5:
+            return (
+                f"'{habit.name}' (weekly): satisfied in {satisfied_weeks} of the "
+                "last 6 weeks — no recurring failure pattern."
+            )
+        return (
+            f"'{habit.name}' (weekly): satisfied in only {satisfied_weeks} of the "
+            "last 6 weeks — a recurring pattern of missing it."
+        )
+
+    due_days = [
+        window_start + timedelta(days=i)
+        for i in range(_PATTERN_LOOKBACK_DAYS)
+        if is_due_today(habit, window_start + timedelta(days=i))
+    ]
+    if len(due_days) < 5:
+        return (
+            f"'{habit.name}' has only been due {len(due_days)} time(s) in the last "
+            "six weeks — not enough history to call a pattern yet."
+        )
+
+    total_due = len(due_days)
+    total_done = sum(1 for d in due_days if d in done_dates)
+    overall_pct = round(100 * total_done / total_due)
+
+    # Current run of consecutive missed due days, most recent first.
+    miss_streak = 0
+    for day in reversed(due_days):
+        if day in done_dates:
+            break
+        miss_streak += 1
+
+    # Per-weekday trouble spots: a weekday the habit was due on at least 3
+    # times and missed on more than half of them.
+    weekday_lines = []
+    for weekday_index, weekday_name in enumerate(_WEEKDAY_LABELS):
+        days = [d for d in due_days if d.weekday() == weekday_index]
+        if len(days) < 3:
+            continue
+        missed = sum(1 for d in days if d not in done_dates)
+        if missed > len(days) / 2:
+            weekday_lines.append(f"{weekday_name}s: missed {missed} of the last {len(days)}")
+
+    parts = [
+        f"'{habit.name}' over the last six weeks: done {total_done}/{total_due} "
+        f"due days ({overall_pct}%)."
+    ]
+    if miss_streak >= 2:
+        parts.append(f"Currently missed {miss_streak} due days in a row.")
+    if len(weekday_lines) >= 5:
+        # Nearly every weekday is bad — that's an "almost stopped doing it"
+        # pattern, not a weekday-specific one; don't enumerate all seven.
+        parts.append("Missed on most due days across the whole week, not one particular weekday.")
+    elif weekday_lines:
+        parts.append("Weekday trouble spots — " + "; ".join(weekday_lines) + ".")
+    if not weekday_lines and miss_streak < 2 and overall_pct >= 80:
+        parts.append("No strong recurring failure pattern — looks like a one-off off day.")
+    return " ".join(parts)
+
+
 @tool
 def get_habit_history_pattern(habit_name: str, *, runtime: ToolRuntime) -> str:
     """Analyze one habit's recent logged history for a *recurring* failure
@@ -241,82 +334,7 @@ def get_habit_history_pattern(habit_name: str, *, runtime: ToolRuntime) -> str:
                 f"'{habit_name}' matches more than one habit: {names}. "
                 "Ask the user which one they mean."
             )
-
-        today = date.today()
-        window_start = today - timedelta(days=_PATTERN_LOOKBACK_DAYS - 1)
-        done_dates = {
-            log.date
-            for log in habit.logs
-            if log.status == "done" and window_start <= log.date <= today
-        }
-
-        # Weekly habits: "days of the week" don't apply — report satisfied-or-not
-        # per trailing week instead, matching get_weekly_summary's treatment.
-        if satisfaction_window_days(habit.frequency) >= 7:
-            satisfied_weeks = sum(
-                1
-                for offset in range(6)
-                if done_dates
-                & {today - timedelta(days=7 * offset + d) for d in range(7)}
-            )
-            if satisfied_weeks >= 5:
-                return (
-                    f"'{habit.name}' (weekly): satisfied in {satisfied_weeks} of the "
-                    "last 6 weeks — no recurring failure pattern."
-                )
-            return (
-                f"'{habit.name}' (weekly): satisfied in only {satisfied_weeks} of the "
-                "last 6 weeks — a recurring pattern of missing it."
-            )
-
-        due_days = [
-            window_start + timedelta(days=i)
-            for i in range(_PATTERN_LOOKBACK_DAYS)
-            if is_due_today(habit, window_start + timedelta(days=i))
-        ]
-        if len(due_days) < 5:
-            return (
-                f"'{habit.name}' has only been due {len(due_days)} time(s) in the last "
-                "six weeks — not enough history to call a pattern yet."
-            )
-
-        total_due = len(due_days)
-        total_done = sum(1 for d in due_days if d in done_dates)
-        overall_pct = round(100 * total_done / total_due)
-
-        # Current run of consecutive missed due days, most recent first.
-        miss_streak = 0
-        for day in reversed(due_days):
-            if day in done_dates:
-                break
-            miss_streak += 1
-
-        # Per-weekday trouble spots: a weekday the habit was due on at least 3
-        # times and missed on more than half of them.
-        weekday_lines = []
-        for weekday_index, weekday_name in enumerate(_WEEKDAY_LABELS):
-            days = [d for d in due_days if d.weekday() == weekday_index]
-            if len(days) < 3:
-                continue
-            missed = sum(1 for d in days if d not in done_dates)
-            if missed > len(days) / 2:
-                weekday_lines.append(f"{weekday_name}s: missed {missed} of the last {len(days)}")
-
-        parts = [
-            f"'{habit.name}' over the last six weeks: done {total_done}/{total_due} "
-            f"due days ({overall_pct}%)."
-        ]
-        if miss_streak >= 2:
-            parts.append(f"Currently missed {miss_streak} due days in a row.")
-        if len(weekday_lines) >= 5:
-            # Nearly every weekday is bad — that's an "almost stopped doing it"
-            # pattern, not a weekday-specific one; don't enumerate all seven.
-            parts.append("Missed on most due days across the whole week, not one particular weekday.")
-        elif weekday_lines:
-            parts.append("Weekday trouble spots — " + "; ".join(weekday_lines) + ".")
-        if not weekday_lines and miss_streak < 2 and overall_pct >= 80:
-            parts.append("No strong recurring failure pattern — looks like a one-off off day.")
-        return " ".join(parts)
+        return describe_habit_pattern(habit, date.today())
     finally:
         session.close()
 

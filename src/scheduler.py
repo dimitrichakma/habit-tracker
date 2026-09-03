@@ -32,6 +32,7 @@ from telegram import Bot
 
 from .database import Habit, User, get_session, is_due_today, is_satisfied, record_token_usage
 from .summarize_memory import summarize_user_week
+from .tools import describe_habit_pattern
 
 logger = logging.getLogger(__name__)
 
@@ -79,19 +80,26 @@ def _resolve_user_id(username: str) -> int:
         session.close()
 
 
-def _pending_habit_names(user_id: int, today: date) -> list[str]:
-    """Names of habits that are due today but not yet satisfied — the same
-    'pending' definition as /habits/today and the get_pending_habits tool,
-    via the shared is_due_today / is_satisfied helpers (never a separate
-    raw query)."""
+def _friction_context(user_id: int, today: date) -> tuple[list[str], list[str]]:
+    """`(pending habit names, one six-week pattern line per pending habit)` for
+    the evening nudge.
+
+    'pending' is the shared is_due_today / is_satisfied definition (same as
+    /habits/today and get_pending_habits) — never a separate raw query. The
+    pattern lines are computed HERE, in Python, and handed to the agent in the
+    trigger prompt, so the nudge turn makes zero tool calls. It used to call
+    get_habit_history_pattern once per pending habit — each a full worker
+    round trip that re-sent the whole thread — which is most of why the nudge
+    was the slowest turn the agent ran."""
     session = get_session()
     try:
         habits = session.query(Habit).filter(Habit.user_id == user_id).all()
-        return [
-            habit.name
+        pending = [
+            habit
             for habit in habits
             if is_due_today(habit, today) and not is_satisfied(habit, today)
         ]
+        return [h.name for h in pending], [describe_habit_pattern(h, today) for h in pending]
     finally:
         session.close()
 
@@ -142,19 +150,30 @@ async def run_friction_nudge(
     incomplete. It's not *blocked* on the budget, though: the scheduled
     nudge is the app being proactive, and shouldn't go silent because the
     user chatted a lot today.
+
+    Speed: the pending check AND each habit's six-week pattern are computed
+    in Python (_friction_context) and handed to the agent in the trigger, so
+    the nudge is one worker call with no tool round trips. It also runs on a
+    throwaway thread (`friction-<user_id>-<nonce>`), not the user's chat
+    thread — the nudge needs no conversation memory, and keeping it off the
+    chat thread stops the daily nudges inflating every later chat turn.
     """
     today = date.today()
-    pending = _pending_habit_names(user_id, today)
+    pending, patterns = _friction_context(user_id, today)
     if not pending:
         return None
 
     listed = ", ".join(pending)
+    pattern_block = "\n".join(f"- {line}" for line in patterns)
     trigger = (
-        "This is the automated evening check-in. The user still has these habits "
-        f"pending today: {listed}. Give a short, encouraging nudge (a few sentences, "
-        "no lists). If any of these habits shows a genuine recurring failure pattern, "
-        "follow your normal missed-habit process for it and offer a smaller "
-        "micro-commitment. Do not shame the user."
+        "This is the automated evening check-in. Everything you need is below — "
+        "do NOT call any tools, just write the nudge.\n\n"
+        f"Habits still pending today: {listed}.\n\n"
+        f"Six-week history for each:\n{pattern_block}\n\n"
+        "Write a short, encouraging nudge (a few sentences, no lists). If one of "
+        "the histories above shows a genuine recurring failure pattern (not a "
+        "one-off), name a smaller micro-commitment for that habit — your own "
+        "judgment. Do not shame the user."
     )
     metadata = {
         "user_id": user_id,
@@ -167,7 +186,7 @@ async def run_friction_nudge(
     result = await agent.ainvoke(
         {"messages": [{"role": "user", "content": trigger}]},
         config={
-            "configurable": {"thread_id": str(user_id)},
+            "configurable": {"thread_id": f"friction-{user_id}-{uuid.uuid4().hex[:8]}"},
             "tags": ["friction-check", origin, "habit-tracking"],
             "metadata": metadata,
             "run_name": f"friction_nudge:{origin}",

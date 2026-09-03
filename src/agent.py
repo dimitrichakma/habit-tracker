@@ -361,9 +361,14 @@ def _message_text(content: object) -> str:
 
 def _acting_user_id() -> int | None:
     """The user id for the turn being classified, from the run config's
-    thread_id (same source every tool uses). None if it can't be resolved."""
+    thread_id (same source every tool uses). None if it can't be resolved.
+    Handles the scheduled nudge's throwaway `friction-<user_id>-<nonce>`
+    thread the same way tools._current_user_id does."""
     try:
-        return int(get_config()["configurable"]["thread_id"])
+        raw = str(get_config()["configurable"]["thread_id"])
+        if raw.isdigit():
+            return int(raw)
+        return next(int(part) for part in raw.split("-") if part.isdigit())
     except Exception:
         return None
 
@@ -500,6 +505,15 @@ async def input_guardrail(state, runtime) -> dict | None:
     text = _message_text(last.content).strip()
     if not text:
         return None
+
+    # The scheduled friction nudge's trigger is server-authored, not user
+    # input — screening it is pointless (and it reads as off-topic in a
+    # vacuum). The output guardrail still checks the coach's reply.
+    try:
+        if "friction-check" in (get_config().get("tags") or []):
+            return None
+    except Exception:
+        pass
 
     if any(pattern.search(text) for pattern in _INJECTION_PATTERNS):
         return _blocked_turn(GuardrailCategory.PROMPT_INJECTION, 1.0, "deterministic pre-filter match")

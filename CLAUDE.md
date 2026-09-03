@@ -143,7 +143,11 @@
     confirms first).
   - `get_habit_history_pattern(habit_name)` — **Phase 3**. Plain-text
     pattern summary from `HabitLog` history (e.g. "missed 4 of last 5
-    Mondays"), pure SQL, no schema change.
+    Mondays"), pure SQL, no schema change. The tool is a thin wrapper
+    (resolve user → `_find_habit` → …) around **`describe_habit_pattern(habit,
+    today)`**, a pure module-level function (no session, no user
+    resolution). `scheduler._friction_context` calls that function directly
+    so the evening nudge doesn't have to spend a tool round trip per habit.
   - `query_past_behavior(topic)` — **Phase 4**. Calls the generic
     LangChain `VectorStore.similarity_search` interface (never a
     backend-specific API — this is exactly why the Phase 5 pgvector
@@ -363,6 +367,16 @@
   - Daily 20:00 — resolves `User.id` from `HABIT_TRACKER_USERNAME`,
     invokes the agent in-process for a coached nudge (pattern-check +
     micro-commitment, Phase 3 logic), sends via Telegram if habits pending.
+  - `_friction_context(user_id, today)` → `(pending names, per-habit
+    six-week pattern lines)`. Both the pending check (shared
+    `is_due_today`/`is_satisfied`) AND each habit's pattern
+    (`tools.describe_habit_pattern`, the pure function extracted from the
+    `get_habit_history_pattern` tool) are computed **in Python** and put in
+    the trigger prompt, which tells the coach *not* to call any tools — so
+    the nudge is **one worker call, zero tool round trips** (it used to call
+    `get_habit_history_pattern` once per pending habit, each a full
+    re-transmitted turn; that was most of why the nudge was the slowest turn
+    the agent ran).
   - Weekly, Sunday 23:59 — **Phase 4**. Calls `summarize_memory`'s
     function directly.
   - Both jobs share this one scheduler instance — never a second one.
@@ -377,6 +391,21 @@
     (best-effort) so this path's worker + Haiku tokens land in the daily
     ledger — it does NOT check the budget, though: the scheduled nudge
     stays proactive regardless of the user's chat usage.
+    - Runs on a **throwaway thread** `friction-<user_id>-<nonce>`, not the
+      user's chat thread (`str(user_id)`). The nudge needs no conversation
+      memory, and keeping it off the chat thread stops the daily nudges
+      inflating every later chat turn's re-sent history.
+      `tools._current_user_id` and `agent._acting_user_id` both parse the
+      user id out of that thread-id shape (first all-digit `-`-segment);
+      chat/Telegram/eval threads stay a bare numeric id.
+    - `agent.input_guardrail` early-returns when the run is tagged
+      `friction-check` — the trigger is server-authored, not user input, and
+      reads as off-topic in a vacuum. The output guardrail still checks the
+      reply.
+    - `POST /evaluate_friction` wraps the call in `asyncio.wait_for(...,
+      AGENT_TIMEOUT_SECONDS)` → `AGENT_UNAVAILABLE_MESSAGE` on timeout (the
+      scheduled path has no timeout — nobody's waiting, and `_send_reminder`
+      logs its own failures).
 - `src/mcp_server.py` — **Phase 3, standalone learning exercise, NOT
   connected to the production agent.** FastMCP, stdio transport, run
   independently (Claude Desktop, MCP Inspector). Reuses the `tools.py`
@@ -784,9 +813,10 @@
   runs; the "legacy API usage detected" LangSmith banner comes from
   ad-hoc `list_runs()` debugging calls and self-clears.
 - No circular imports (`main → agent → tools → database`; `main → bot`
-  with no cycle back; `auth` is a leaf; `main → scheduler` /
-  `main → agent` with `_environment` duplicated in `scheduler` to avoid
-  a cycle back to `main`).
+  with no cycle back; `auth` is a leaf; `main → scheduler → {tools,
+  summarize_memory}` with `_environment` / `_reply_text` duplicated in
+  `scheduler` — not imported from `main` — to avoid a cycle back to `main`;
+  `tools` imports nothing from `agent`/`scheduler`/`main`).
 - Never run tests against the real Neon database or a real
   `habits.db`/`checkpoints.db` — use an isolated throwaway DB (the eval
   suite already does). Read-only inspection is fine.
