@@ -11,9 +11,20 @@ For each golden case in ``datasets/golden_habits.json``:
   3. The tool's own ``ToolMessage`` output is pulled from the message history
      as ``actual_retrieved_context`` and passed to ``LLMTestCase`` — *not* the
      golden JSON's ``retrieval_context`` (that only feeds the mock).
-  4. ``FaithfulnessMetric``, ``ContextualPrecisionMetric`` and
-     ``CoachingEmpathyMetric`` grade the reply — all three on the same
-     ``claude-opus-5`` judge (the two built-ins default to OpenAI otherwise).
+  4. ``FaithfulnessMetric`` (does the reply stay true to the retrieved
+     summaries — the RAG-hallucination check) and ``CoachingEmpathyMetric``
+     (acknowledges the setback without shaming + a concrete next step) grade
+     the reply, both on the same ``claude-opus-5`` judge (Faithfulness would
+     default to OpenAI otherwise).
+
+``ContextualPrecisionMetric`` was removed: it grades a *retrieval system*
+(are relevant chunks ranked above irrelevant ones), but retrieval here is
+mocked to return exactly the hand-authored golden ``retrieval_context`` — so
+it sat pinned at 1.00 every run with no signal about the agent. The real
+retrieval-relevance question is covered by the non-mocked
+``tests/test_vector_store_integration.py`` (Phase 6). ``LLMTestCase`` keeps
+``expected_output`` for documentation even though neither remaining metric
+reads it.
 
 Isolation: the agent's checkpoint DB and the app's ``habits.db`` are pointed
 at throwaway temp files — this suite never reads or writes the real ones.
@@ -45,7 +56,7 @@ from sqlalchemy.orm import sessionmaker
 
 import src.agent as agent_module
 import src.database as database
-from deepeval.metrics import ContextualPrecisionMetric, FaithfulnessMetric
+from deepeval.metrics import FaithfulnessMetric
 from deepeval.test_case import LLMTestCase
 from langchain_core.documents import Document
 from langchain_core.messages import ToolMessage
@@ -57,7 +68,6 @@ GOLDEN_CASES = load_golden_cases()
 CASE_IDS = [case["name"] for case in GOLDEN_CASES]
 
 FAITHFULNESS_THRESHOLD = 0.7
-CONTEXT_PRECISION_THRESHOLD = 0.7
 EMPATHY_THRESHOLD = 0.7
 
 QUERY_PAST_BEHAVIOR = "query_past_behavior"
@@ -170,7 +180,6 @@ async def test_rag_agent_golden_case(case):
     judge = get_judge_model()
     metrics = [
         FaithfulnessMetric(threshold=FAITHFULNESS_THRESHOLD, model=judge),
-        ContextualPrecisionMetric(threshold=CONTEXT_PRECISION_THRESHOLD, model=judge),
         CoachingEmpathyMetric(threshold=EMPATHY_THRESHOLD),
     ]
 

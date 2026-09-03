@@ -148,13 +148,19 @@
     → asks to disambiguate on multiple matches.
 - `src/agent.py` — built via `langchain.agents.create_agent` (never the
   deprecated `langgraph.prebuilt.create_react_agent`).
-  - Model: `ChatAnthropic(model="claude-sonnet-5")` — verify current
-    before assuming.
+  - Model: `ChatAnthropic(model="claude-sonnet-5",
+    output_config={"effort": WORKER_EFFORT})` — verify the model string is
+    current before assuming. `WORKER_EFFORT` (env, default `"medium"`) caps
+    adaptive-thinking depth: `claude-sonnet-5` defaults to `effort: high`,
+    which drove the slow-turn latency tail; `"medium"` trims it without the
+    shallowness `"low"` risks (validated against `evaluation/test_rag_agent.py`).
   - Dynamic system prompt via `@dynamic_prompt` middleware
     (`langchain.agents.middleware`) — NOT a callable to `system_prompt=`
     (unsupported). Returns two content blocks: the static ~90-line rules
     block carries an Anthropic prompt-cache breakpoint
-    (`cache_control: ephemeral`, **Phase 6** latency work); the
+    (`cache_control: {"type": "ephemeral", "ttl": "1h"}`, **Phase 6** latency
+    work — the 1h TTL keeps the ~3.4k-token prefix warm across the 5-60 min
+    gaps typical of single-user usage, which the 5-minute default missed); the
     per-second timestamp is a separate uncached block after it.
   - **Phase 6 guardrails** (the "AI guardrails & semantic safety"
     section): `input_guardrail` (`@before_model(can_jump_to=["end"])`)
@@ -386,9 +392,14 @@
     5, the only tier above, rejects the sampling params and needs 30-day
     retention) and is a tier above the `claude-sonnet-5` worker. Anthropic
     has no `seed` — temperature=0 is the only determinism lever, and
-    DeepEval's wrapper drops it anyway since opus-5 deprecated it.
-    `test_rag_agent.py` reuses `get_judge_model()` for the two built-in
-    RAG metrics (which default to OpenAI otherwise).
+    DeepEval's wrapper drops it anyway since opus-5 deprecated it. (DeepEval
+    4.2's `AnthropicModel` also sends `thinking: disabled` to opus-5, so the
+    judge already runs without thinking tokens.)
+    `test_rag_agent.py` reuses `get_judge_model()` for `FaithfulnessMetric`
+    (which defaults to OpenAI otherwise). `ContextualPrecisionMetric` was
+    **removed** from that suite: it grades a retrieval system, but retrieval
+    there is mocked to return the golden `retrieval_context` verbatim — it sat
+    pinned at 1.00 with no signal about the agent, so it was pure judge cost.
   - `evaluation/datasets/golden_habits.json` — at least 5 golden cases,
     each with `input`, `expected_output`, `retrieval_context`. The
     `retrieval_context` field here is ground truth for what *should* be
@@ -449,10 +460,13 @@
       `retrieval_context` parameter, since the metrics need the literal
       text the agent actually saw (which should match the mock's output,
       confirming the plumbing works end to end).
-    - `await metric.a_measure(test_case)` for `FaithfulnessMetric`,
-      `ContextualPrecisionMetric` (both passed `model=get_judge_model()`,
-      or they default to OpenAI) and `CoachingEmpathyMetric()`; collects
-      per-metric failures with score + reason. All 6 cases currently pass.
+    - `await metric.a_measure(test_case)` for `FaithfulnessMetric`
+      (`model=get_judge_model()`, or it defaults to OpenAI — the
+      RAG-hallucination check: does the reply stay true to the retrieved
+      summaries) and `CoachingEmpathyMetric()`; collects per-metric failures
+      with score + reason. All 6 cases pass. `ContextualPrecisionMetric` was
+      dropped — vacuous under mocked retrieval (always 1.00); the real
+      retrieval-relevance check lives in `tests/`.
     - **Phase 6.1**: an autouse `no_langsmith_tracing` fixture forces
       `LANGSMITH_TRACING=false` (+ `get_env_var.cache_clear()`) so the
       suite never exports to the real `habit-tracker` project.
@@ -523,10 +537,12 @@
 - Trigger a nudge manually: `POST /evaluate_friction` while logged in
 - Generate this week's memory summary now: `uv run python -m src.summarize_memory`
 - Run the RAG/coaching evaluation suite: `uv run pytest evaluation/test_rag_agent.py`
-  — real Anthropic + OpenAI-embedding calls; ~1 agent + 3 opus-5 judge
-  calls per golden case, ~3.5 min for the 6 cases. Needs `ANTHROPIC_API_KEY`
-  + `OPENAI_API_KEY` (does NOT need `DATABASE_URL` — it mocks retrieval
-  and uses a throwaway SQLite).
+  — real Anthropic + OpenAI-embedding calls; per golden case ~1 agent turn +
+  the opus-5 judge for `FaithfulnessMetric` (several sub-calls) and
+  `CoachingEmpathyMetric` (one call), ~2.5-3 min for the 6 cases. Needs
+  `ANTHROPIC_API_KEY` + `OPENAI_API_KEY` (does NOT need `DATABASE_URL` — it
+  mocks retrieval and uses a throwaway SQLite). Transient `529 Overloaded`
+  from Anthropic can fail a case on the judge — retry that case.
 - Run the guardrail suite: `uv run pytest evaluation/test_guardrails.py`
   — real Anthropic (Haiku classifier + Sonnet worker on the pass-through
   cases). Throwaway SQLite; no `DATABASE_URL`.
@@ -569,8 +585,9 @@
     (1000), `MAX_DAILY_QUOTA` (200000 tokens/user/day), `AGENT_TIMEOUT_SECONDS`
     (30). `GUARDRAIL_TIMEOUT_SECONDS` (8), `GUARDRAIL_OUTPUT_LLM_CHECK` (on),
     `HARM_SUPPORT_RESOURCE` (override the support-resource text in the
-    harmful-behavior refusal). `TEST_DATABASE_URL` — scratch DB for
-    `tests/` (must differ from `DATABASE_URL`).
+    harmful-behavior refusal). `WORKER_EFFORT` (`medium`) — adaptive-thinking
+    depth for the coaching model; `low`/`medium`/`high`. `TEST_DATABASE_URL`
+    — scratch DB for `tests/` (must differ from `DATABASE_URL`).
 - **Checkpointer uses Neon's DIRECT endpoint; everything else uses the
   POOLED endpoint.** `postgres_checkpointer()` runs server-side prepared
   statements (`prepare_threshold=0`) that PgBouncer transaction pooling
@@ -638,6 +655,11 @@
   flakiness. No `seed` parameter is set — Anthropic's API has no
   equivalent to OpenAI's `seed`, so don't add one under the assumption
   it will work.
+- `test_rag_agent.py` grades with `FaithfulnessMetric` + `CoachingEmpathyMetric`
+  only. Do NOT re-add `ContextualPrecisionMetric` (or any retrieval-system
+  metric): retrieval is mocked to return the golden context verbatim, so it
+  has no signal and only burns judge tokens. Retrieval correctness is
+  `tests/test_vector_store_integration.py`'s job.
 - The real (non-mocked) vector-store integration test now lives in
   `tests/test_vector_store_integration.py` (Phase 6) — the eval suite
   still mocks retrieval on purpose. Never run either against the real

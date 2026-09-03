@@ -17,8 +17,10 @@ near-deterministic, and Anthropic has no `seed` equivalent, so temperature=0
 is the available (and only) determinism lever, stated for intent.
 
 `test_rag_agent.py` imports `get_judge_model()` and hands the SAME model to
-`FaithfulnessMetric` / `ContextualPrecisionMetric`, which otherwise default to
-OpenAI internally — so all three metrics judge on one provider.
+`FaithfulnessMetric` (which would otherwise default to OpenAI internally) — so
+both metrics judge on one Claude provider. (`ContextualPrecisionMetric` was
+dropped from that suite — with mocked retrieval it had no signal; see
+`test_rag_agent.py`'s module docstring.)
 """
 
 from __future__ import annotations

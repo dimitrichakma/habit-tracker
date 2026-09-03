@@ -34,6 +34,12 @@ logger = logging.getLogger(__name__)
 # from main.py's JWT auth, never a client-supplied string.
 
 MODEL_NAME = "claude-sonnet-5"
+# Adaptive-thinking depth for the worker model. `claude-sonnet-5` runs adaptive
+# thinking by default at effort "high"; "medium" trims the long latency tail on
+# the harder turns (reflection, pattern judgment, compound logging) without the
+# shallowness "low" risks. evaluation/test_rag_agent.py is the guard on quality.
+# Env-overridable so it can be tuned without a redeploy.
+WORKER_EFFORT = os.environ.get("WORKER_EFFORT", "medium")
 # SQLite fallback checkpoint file — used only when build_agent() gets no
 # checkpointer (local dev without a Postgres URL, and the Phase 4 eval suite,
 # which monkeypatches this constant to a temp path). Deployment runs on
@@ -116,10 +122,13 @@ def habit_coach_prompt(_request: ModelRequest) -> SystemMessage:
     logging a habit.
 
     Returned as two content blocks: the static rules carry an Anthropic prompt-
-    cache breakpoint (`cache_control`), so the tool schemas + these ~90 lines
-    are served from cache on the second model call of a turn and on follow-up
-    turns within the 5-minute TTL. The per-second timestamp is a separate,
-    uncached block placed after the breakpoint so it never busts that cache.
+    cache breakpoint (`cache_control`) with a **1-hour TTL** — the tool schemas
+    + these ~90 lines are served from cache on the second model call of a turn
+    and on any follow-up turn started within an hour (single-user usage is
+    bursty, with 5-60 min gaps — the 5-minute default expired on most of those,
+    paying a full re-process; the 1h write costs 2x instead of 1.25x, trivial
+    for one user). The per-second timestamp is a separate, uncached block placed
+    after the breakpoint so it never busts that cache.
 
     `_request` is unused (the prompt needs no per-request state) but
     @dynamic_prompt always passes one positionally, so it's kept and
@@ -127,7 +136,11 @@ def habit_coach_prompt(_request: ModelRequest) -> SystemMessage:
     now = datetime.now().isoformat(timespec="seconds")
     return SystemMessage(
         content=[
-            {"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}},
+            {
+                "type": "text",
+                "text": SYSTEM_PROMPT,
+                "cache_control": {"type": "ephemeral", "ttl": "1h"},
+            },
             {"type": "text", "text": f"{_CURRENT_TIME_LABEL}{now}"},
         ]
     )
@@ -529,7 +542,7 @@ async def build_agent(checkpointer=None):
     URL — an `AsyncSqliteSaver` on `CHECKPOINT_DB` is used instead, so tests
     and laptops never need Postgres.
     """
-    model = ChatAnthropic(model=MODEL_NAME)
+    model = ChatAnthropic(model=MODEL_NAME, output_config={"effort": WORKER_EFFORT})
 
     def _compile(saver):
         return create_agent(

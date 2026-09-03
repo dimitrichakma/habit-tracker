@@ -40,7 +40,7 @@ without ever guessing at data it hasn't actually looked up.
   Desktop, built as a learning exercise in the protocol.
 - **An LLM-as-a-Judge evaluation suite** - a golden dataset of coaching
   scenarios, graded by a stronger Claude model against a custom empathy
-  metric plus faithfulness and context-precision, proving the agent
+  metric and a faithfulness (no-invented-facts) check, proving the agent
   acknowledges failure without shaming and always offers an actionable step.
 - **Safety in two layers.** In the agent: an input classifier (Claude
   Haiku, behind a regex pre-filter) that intercepts prompt injection,
@@ -137,16 +137,21 @@ Streamlit Cloud            Telegram  --webhook-->  ┌────────�
 
 ## Evaluation
 
-`pytest evaluation/` runs 6 golden coaching scenarios through the **real**
-agent and grades each reply with three metrics, all judged by
+`pytest evaluation/test_rag_agent.py` runs 6 golden coaching scenarios through
+the **real** agent and grades each reply with two metrics, both judged by
 `claude-opus-5` (a tier above the `claude-sonnet-5` agent, to reduce
 self-grading bias):
 
 | Metric | Checks | Threshold | Across the 6 scenarios |
 |---|---|---|---|
-| **Contextual Precision** (DeepEval) | the retrieved context was relevant to the question | 0.70 | 1.00 on every case |
 | **Faithfulness** (DeepEval) | the reply sticks to what was actually retrieved — no invented facts | 0.70 | 0.75 – 1.00 (mean 0.92) |
 | **Coaching Empathy** (custom) | acknowledges the setback without shaming **and** offers a concrete next step; any shaming caps the score at 0.2 | 0.70 | 0.60 – 1.00 (mean 0.89) |
+
+A third metric, DeepEval's Contextual Precision, was removed: it grades a
+*retrieval system*, but this suite mocks retrieval to hand the agent the exact
+golden context — so it sat pinned at 1.00 with nothing to say about the agent.
+Real retrieval correctness is checked separately by the non-mocked pgvector
+integration test.
 
 The scenarios cover the situations the coach has to get right: a habit
 failing only on late-wake days, weekend structure collapse, one habit
