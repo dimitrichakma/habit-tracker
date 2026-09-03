@@ -49,9 +49,22 @@ without ever guessing at data it hasn't actually looked up.
   Haiku, behind a regex pre-filter) that intercepts prompt injection,
   off-topic requests, and genuinely harmful ones (self-harm, disordered
   eating framed as a "habit") before the coach model runs, plus an output
-  check for leaked internals. In front of it: a gateway with per-user rate
-  limits, a message size cap, regex PII masking, a daily token budget, and
-  a hard timeout — every check fails safe.
+  check for leaked internals. The classifier is given the user's habit
+  names and recent turns as context, so a mid-conversation progress update
+  ("the lesson isn't done yet") isn't mistaken for an off-topic aside —
+  and an off-topic guess only hard-blocks above a confidence threshold,
+  otherwise the coach just redirects it. In front of it: a gateway with
+  per-user rate limits, a message size cap, regex PII masking, a daily
+  token budget, and a hard timeout — every check fails safe.
+- **Bounded conversation cost.** The Claude API is stateless — every turn
+  re-sends the whole thread, and the coach makes 2–4 model calls a turn —
+  so a months-old thread can run the daily token budget up fast (it once
+  did, in three messages). A history-trimming middleware caps how much of
+  an old thread is re-sent per call; the full history still lives in the
+  database and in `/chat/history`. The static system prompt + tool schemas
+  carry a 1-hour Anthropic prompt-cache breakpoint so bursty single-user
+  turns stay on the cheap path. The daily token budget counts every model
+  call a turn makes, the two Haiku guardrail classifiers included.
 - **Request tracing.** Every conversation is traced to LangSmith with tags
   and a correlation id that also threads through the logs, so a single
   Telegram message can be followed end to end. Tracing is out-of-band — a
@@ -78,8 +91,10 @@ Streamlit Cloud            Telegram  --webhook-->  ┌────────�
   webhook (`/webhook/telegram`) and a `/healthz` probe. Deployed with
   `railway up` from the CLI.
 - **LangGraph** (`langchain.agents.create_agent`) - the coaching agent, with
-  a dynamic system prompt (recomputed on every call, so the model always
-  knows the real current time) and a fixed set of tools.
+  a fixed set of tools and four middleware hooks: a dynamic system prompt
+  (recomputed on every call so the model always knows the real current time,
+  with a 1-hour prompt-cache breakpoint on the static part), the
+  input/output safety guardrails, and history trimming.
 - **SQLAlchemy + Neon PostgreSQL** - one database holds three things: the
   relational tables (users, habits, logs), LangGraph's per-thread
   conversation memory (`AsyncPostgresSaver`), and the vector store. Local
@@ -130,13 +145,28 @@ Streamlit Cloud            Telegram  --webhook-->  ┌────────�
 - **Safety is layered and fails safe.** The guardrails are `create_agent`
   middleware, not a bespoke graph, so they don't fight the checkpointer; a
   deterministic regex pre-filter runs before any classifier call; and on a
-  classifier error the request is *blocked*, never let through. The gateway
-  sits outside the agent entirely — a message that's too long, or over the
-  token budget, never reaches a model.
+  classifier error the request is *blocked*, never let through. Blocking is
+  deliberately asymmetric: prompt injection and harmful behaviour block at
+  any confidence, but an off-topic guess only blocks when the classifier is
+  sure — a wrongly-blocked habit update costs the one user far more than a
+  mildly off-topic message reaching a coach that redirects it anyway. The
+  gateway sits outside the agent entirely — a message that's too long, or
+  over the token budget, never reaches a model.
 - **Classification is Claude too.** The guardrail classifier is Claude Haiku,
   not a cheaper non-Claude model — the "every model that generates, judges,
   or classifies text is Claude" rule holds, including in fallback paths.
   OpenAI is still only ever the embedding maths.
+- **The guardrails are hand-rolled, not a library.** No `guardrails-ai`,
+  NeMo Guardrails, or LlamaGuard — those assume a request/response shape or
+  a policy DSL that doesn't fit an agent which short-circuits its own
+  tool-calling loop mid-turn. Two `create_agent` middleware hooks plus a
+  Haiku classifier fit in ~150 lines and reuse the tracing and provider-split
+  rules already in place.
+- **Stable prompt prefix, volatile suffix.** The system prompt is emitted as
+  two blocks: the ~90 static rule lines carry the cache breakpoint; the
+  per-second timestamp the agent needs to judge "today" is a separate block
+  *after* it, so it never busts the cache. History trimming likewise only
+  touches the message list, never the cached prefix or the tool schemas.
 
 ## Evaluation
 
@@ -295,4 +325,5 @@ Feature-complete through Phase 6.
 - **Phase 3** — pattern-aware coaching, micro-commitments, standalone MCP server ✅
 - **Phase 4** — semantic memory (RAG) over weekly summaries + LLM-as-a-Judge evaluation suite ✅
 - **Phase 5** — SQLite → Neon Postgres + pgvector, Telegram polling → webhook, Docker packaging; backend live on Railway, frontend on Streamlit Cloud ✅
-- **Phase 6** — LangSmith tracing + correlation ids, security layer (signup gate, rate limiting, headers), prompt-caching latency work, a real non-mocked pgvector integration test, AI guardrails (input/output safety classification), and an infrastructure gateway (size cap, PII masking, token budget, timeout, generic errors) ✅
+- **Phase 6** — LangSmith tracing + correlation ids, security layer (signup gate that fails *closed* on a deployment, rate limiting, headers), latency work (worker thinking capped to `medium`, 1-hour prompt-cache TTL, history-trimming middleware), a real non-mocked pgvector integration test, AI guardrails (input/output safety classification, context-aware with an asymmetric block policy), and an infrastructure gateway (size cap, PII masking, token budget covering the guardrail classifiers too, timeout, generic errors) ✅
+  - Post-launch fixes from production traces: three messages on a months-old thread blew the 200k daily token cap → history trimming + a higher quota + thread cleanup; the off-topic classifier blocked a real habit update → habit-name/recent-turn context + soft-blocking below `OFF_TOPIC_BLOCK_CONFIDENCE`; `bot.py` stopped echoing raw exception text to Telegram; `deepeval` / `pytest` moved to the dev dependency group so `uv sync --no-dev` drops them from the Railway image.
