@@ -78,8 +78,11 @@
 - Auth: bcrypt (not passlib — incompatible with bcrypt≥4.1), pyjwt
 - Phase 2: python-telegram-bot (v22, async — webhook, not polling), apscheduler
 - Phase 3: `mcp` (FastMCP, standalone learning server only)
-- Phase 4: `langchain-openai` (`text-embedding-3-small` embeddings only),
-  `deepeval` + `pytest` + `pytest-asyncio` (still in `[project.dependencies]`).
+- Phase 4: `langchain-openai` (`text-embedding-3-small` embeddings only,
+  runtime). `deepeval` + `pytest` + `pytest-asyncio` are in
+  `[dependency-groups] dev` — test/eval only, nothing under `src/` imports
+  them, and the `Dockerfile`'s `uv sync --no-dev` keeps them out of the
+  Railway image.
 - Phase 5: `psycopg[binary,pool]`, `pgvector`, `langchain-postgres`
   (`PGVector`), `langgraph-checkpoint-postgres`. Removed: `chromadb`,
   `langchain-chroma`. `langgraph-checkpoint-sqlite` kept (checkpointer
@@ -89,8 +92,9 @@
 - Phase 6: `langsmith` (≥0.12.1, tracing — bumped from 0.11.1),
   `slowapi` (in-memory rate limiting). The Haiku guardrail classifier
   uses the existing `langchain-anthropic`. Dev group (`[dependency-groups]
-  dev`): `testcontainers[postgres]` for the `tests/` pgvector integration
-  suite. No new runtime NLP deps — PII masking is plain `re`.
+  dev`): `testcontainers[postgres]` (pgvector integration suite), plus
+  `deepeval` / `pytest` / `pytest-asyncio` (moved out of runtime deps).
+  No new runtime NLP deps — PII masking is plain `re`.
 - Package manager: uv
 - `create_agent` lives in `langchain.agents`, not `langchain-anthropic`
 
@@ -605,8 +609,9 @@
   `claude-haiku-4-5-20251001` (fastest tier; `agent.CLASSIFIER_MODEL`),
   the DeepEval judge on `claude-opus-5`. `OPENAI_API_KEY` is used for
   exactly one thing: `OpenAIEmbeddings("text-embedding-3-small")` in
-  `vector_store.py`. `openai` is also DeepEval's unconditional base
-  dependency. Do not route any generation, judging, or classification
+  `vector_store.py` (the Railway image keeps `openai` only because
+  `langchain-openai` depends on it; `deepeval`, which also pulls `openai`,
+  is dev-only now). Do not route any generation, judging, or classification
   through OpenAI — including in error/fallback paths.
 - Tools derive the acting user only from `runtime` (ToolRuntime), never
   an LLM-supplied argument.
@@ -723,10 +728,6 @@
   only safeguards are the ones listed above.
 - The evaluation suite tests agent reasoning over mocked retrieval; the
   real vector-store pipeline is covered separately by `tests/` (Phase 6).
-- `deepeval` / `pytest` / `pytest-asyncio` are still in
-  `[project.dependencies]`, so `uv sync --no-dev` in the `Dockerfile`
-  doesn't drop them — the Railway image carries them (harmless bloat).
-  `testcontainers` is correctly in `[dependency-groups] dev`.
 - The token budget counts only the worker model (`claude-sonnet-5`); the
   Haiku guardrail classifier's tokens are not metered. PII masking is a
   regex heuristic — it will miss unusual formats and can over-mask an

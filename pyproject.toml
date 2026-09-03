@@ -7,7 +7,6 @@ requires-python = ">=3.13"
 dependencies = [
     "apscheduler>=3.11.3",
     "bcrypt>=5.0.0",
-    "deepeval>=4.2.0",
     "fastapi>=0.141.1",
     "httpx>=0.28.1",
     "langchain>=1.3.17",
@@ -24,8 +23,6 @@ dependencies = [
     "psycopg[binary,pool]>=3.3.5",
     "pydantic>=2.13.4",
     "pyjwt>=2.13.0",
-    "pytest>=9.1.1",
-    "pytest-asyncio>=1.4.0",
     "python-dotenv>=1.2.3",
     "python-telegram-bot>=20",
     "requests>=2.34.2",
@@ -36,6 +33,11 @@ dependencies = [
 ]
 
 [dependency-groups]
+# Test / eval only — nothing under src/ imports these. The Dockerfile's
+# `uv sync --no-dev` keeps them out of the Railway image.
 dev = [
+    "deepeval>=4.2.0",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
     "testcontainers[postgres]>=4.15.0",
 ]
