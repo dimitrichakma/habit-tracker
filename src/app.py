@@ -304,11 +304,12 @@ with chat_tab:
             st.markdown(prompt)
 
         with st.chat_message("assistant"):
-            try:
-                response = authed_request("POST", CHAT_URL, json={"message": prompt}, timeout=60)
-                reply = response.json()["reply"]
-            except requests.RequestException as exc:
-                reply = f"Could not reach the habit tracker backend: {exc}"
+            with st.spinner("Coaching…"):
+                try:
+                    response = authed_request("POST", CHAT_URL, json={"message": prompt}, timeout=60)
+                    reply = response.json()["reply"]
+                except requests.RequestException as exc:
+                    reply = f"Could not reach the habit tracker backend: {exc}"
 
             st.markdown(reply)
 
