@@ -14,9 +14,11 @@ from langchain.agents.middleware import (
     after_model,
     before_model,
     dynamic_prompt,
+    wrap_model_call,
 )
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages.utils import count_tokens_approximately, trim_messages
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langsmith import get_current_run_tree
@@ -40,6 +42,14 @@ MODEL_NAME = "claude-sonnet-5"
 # shallowness "low" risks. evaluation/test_rag_agent.py is the guard on quality.
 # Env-overridable so it can be tuned without a redeploy.
 WORKER_EFFORT = os.environ.get("WORKER_EFFORT", "medium")
+# Cap on the conversation history sent to the worker model on each call. The
+# Anthropic API is stateless — every model call re-sends the whole thread — so
+# an ever-growing Telegram thread means an ever-growing per-turn token cost
+# (this is what blew through MAX_DAILY_QUOTA in ~3 turns on a months-old thread:
+# 215k of the 218k spent was re-transmitted history, ~1% was the actual reply).
+# `trim_history` (below) sends only the tail; the full history stays in the
+# checkpoint and in GET /chat/history.
+MAX_HISTORY_TOKENS = int(os.environ.get("MAX_HISTORY_TOKENS", "6000"))
 # SQLite fallback checkpoint file — used only when build_agent() gets no
 # checkpointer (local dev without a Postgres URL, and the Phase 4 eval suite,
 # which monkeypatches this constant to a temp path). Deployment runs on
@@ -495,6 +505,37 @@ async def output_guardrail(state, runtime) -> dict | None:
     return _replace_output(last, verdict.category, verdict.confidence, verdict.reasoning)
 
 
+# ===========================================================================
+# History trimming (cost + latency)
+# ===========================================================================
+
+
+def _trim_history(messages: list) -> list:
+    """Keep only the trailing `MAX_HISTORY_TOKENS` worth of conversation, always
+    starting on a HumanMessage so no orphaned tool result / tool-call pair leads
+    the list (which the API rejects)."""
+    return trim_messages(
+        messages,
+        strategy="last",
+        token_counter=count_tokens_approximately,
+        max_tokens=MAX_HISTORY_TOKENS,
+        start_on="human",
+        include_system=False,  # the system message rides separately on ModelRequest
+        allow_partial=False,
+    )
+
+
+@wrap_model_call
+async def trim_history(request: ModelRequest, handler):
+    """Send the worker model only the tail of the conversation. Only
+    `request.messages` is touched — `request.system_message` (the ~90-line
+    cached rules block) and the tool schemas are untouched, so the prompt cache
+    still hits. The full history stays in the checkpoint; this just bounds what
+    each call costs regardless of how old the thread is."""
+    request = request.override(messages=_trim_history(request.messages))
+    return await handler(request)
+
+
 @asynccontextmanager
 async def postgres_checkpointer(conninfo: str):
     """Yield an `AsyncPostgresSaver` backed by a small managed connection
@@ -549,9 +590,10 @@ async def build_agent(checkpointer=None):
             model,
             tools=TOOLS,
             # input_guardrail screens the user turn (can jump to end);
-            # habit_coach_prompt builds the system prompt; output_guardrail
-            # checks the final reply. See the "AI guardrails" section above.
-            middleware=[input_guardrail, habit_coach_prompt, output_guardrail],
+            # habit_coach_prompt builds the system prompt; trim_history bounds
+            # the history sent to the model; output_guardrail checks the final
+            # reply. See the "AI guardrails" / "History trimming" sections above.
+            middleware=[input_guardrail, habit_coach_prompt, trim_history, output_guardrail],
             checkpointer=saver,
         )
 

@@ -186,7 +186,20 @@
     — any classifier error/timeout (`GUARDRAIL_TIMEOUT_SECONDS`) blocks /
     replaces, never opens. Blocked turns are tagged on the LangSmith run
     (`guardrail_blocked`, `<category>`). `middleware=[input_guardrail,
-    habit_coach_prompt, output_guardrail]`.
+    habit_coach_prompt, trim_history, output_guardrail]`.
+  - **History trimming** (`trim_history`, `@wrap_model_call`): the Anthropic
+    API is stateless — every model call re-sends the whole thread — so an
+    ever-growing Telegram thread meant an ever-growing per-turn token cost
+    (this blew `MAX_DAILY_QUOTA` in ~3 turns on a months-old thread; 98% of
+    the spend was re-transmitted history). `trim_history` does
+    `request.override(messages=trim_messages(..., strategy="last",
+    max_tokens=MAX_HISTORY_TOKENS, start_on="human", token_counter=
+    count_tokens_approximately))` — it shrinks only `request.messages`, so
+    `request.system_message` (the cached rules block) and the tool schemas
+    are untouched and the prompt cache still hits. The **full** history
+    stays in the checkpoint and in `GET /chat/history`; this only bounds
+    what each call costs, no matter how old the thread is. `MAX_HISTORY_TOKENS`
+    env, default 6000. No-op when the thread is already short.
   - Memory (**Phase 5**): `AsyncPostgresSaver`, keyed by `thread_id`.
     `build_agent(checkpointer=None)` is an `@asynccontextmanager`, one
     shared instance per server lifetime; `main.py`'s lifespan passes it
@@ -604,12 +617,17 @@
     (`habit-tracker`) — tracing off if unset. `SIGNUP_SECRET` — gates
     `/auth/signup` (open if unset). `LOGIN_/SIGNUP_/CHAT_/FRICTION_RATE_LIMIT`
     (slowapi strings), `TELEGRAM_RATE_LIMIT_PER_MIN` (int). `MAX_MESSAGE_CHARS`
-    (1000), `MAX_DAILY_QUOTA` (200000 tokens/user/day), `AGENT_TIMEOUT_SECONDS`
-    (30). `GUARDRAIL_TIMEOUT_SECONDS` (8), `GUARDRAIL_OUTPUT_LLM_CHECK` (on),
+    (1000), `MAX_DAILY_QUOTA` (default 200000 tokens/user/day — **raised to
+    1000000 on Railway** after a months-old thread hit the default in ~3
+    turns; see `MAX_HISTORY_TOKENS`), `AGENT_TIMEOUT_SECONDS` (30).
+    `GUARDRAIL_TIMEOUT_SECONDS` (8), `GUARDRAIL_OUTPUT_LLM_CHECK` (on),
     `HARM_SUPPORT_RESOURCE` (override the support-resource text in the
     harmful-behavior refusal). `WORKER_EFFORT` (`medium`) — adaptive-thinking
-    depth for the coaching model; `low`/`medium`/`high`. `TEST_DATABASE_URL`
-    — scratch DB for `tests/` (must differ from `DATABASE_URL`).
+    depth for the coaching model; `low`/`medium`/`high`. `MAX_HISTORY_TOKENS`
+    (6000) — cap on conversation history sent to the worker per call
+    (`trim_history` middleware); bounds the per-turn cost of an old thread.
+    `TEST_DATABASE_URL` — scratch DB for `tests/` (must differ from
+    `DATABASE_URL`).
 - **Checkpointer uses Neon's DIRECT endpoint; everything else uses the
   POOLED endpoint.** `postgres_checkpointer()` runs server-side prepared
   statements (`prepare_threshold=0`) that PgBouncer transaction pooling
@@ -753,7 +771,10 @@
   path now records to the ledger (`/chat`, Telegram webhook via
   `_invoke_agent`; the scheduled nudge + `/evaluate_friction` via
   `run_friction_nudge`), but only `/chat` and the webhook are *blocked*
-  on the cap — the friction paths record without blocking. PII masking is
+  on the cap — the friction paths record without blocking. Most of the
+  count is **re-transmitted conversation history** (the API is stateless):
+  `trim_history` (`MAX_HISTORY_TOKENS`) bounds it per call so an old
+  thread can't run the meter up the way it did once. PII masking is
   a regex heuristic — it will miss unusual formats and can over-mask an
   odd bare 10-15 digit run.
 - **Local-dev notes (by design, not gaps):** `src/bot.py` is no longer
