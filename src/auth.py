@@ -57,17 +57,36 @@ _bearer_scheme = HTTPBearer(auto_error=True)
 
 # Phase 6.2 — gate the otherwise-open /auth/signup on the public backend.
 # When SIGNUP_SECRET is set (Railway), a signup request must present the same
-# value in the X-Signup-Secret header. When it's unset (local dev), signup
-# stays open. This is a single-user app: the one account normally already
-# exists, and the secret only matters if the DB is ever rebuilt.
+# value in the X-Signup-Secret header. This is a single-user app: the one
+# account normally already exists, and the secret only matters if the DB is
+# ever rebuilt.
 SIGNUP_SECRET = os.environ.get("SIGNUP_SECRET")
+
+# "Does this look like a real deployment?" — same signal as
+# main._environment() / scheduler._environment(). Used to decide whether an
+# unset SIGNUP_SECRET means "open (local dev)" or "misconfigured (fail closed)".
+_DEPLOYED = bool(
+    os.environ.get("APP_ENV")
+    or os.environ.get("RAILWAY_ENVIRONMENT_NAME")
+    or os.environ.get("RAILWAY_ENVIRONMENT")
+)
 
 
 def require_signup_allowed(x_signup_secret: str | None = Header(default=None)) -> None:
-    """FastAPI dependency for POST /auth/signup. No-op when SIGNUP_SECRET is
-    unset; otherwise the request must carry a matching X-Signup-Secret header
-    (constant-time compared). Raises 403 on a missing/wrong secret."""
+    """FastAPI dependency for POST /auth/signup.
+
+    - SIGNUP_SECRET set → the request must carry a matching X-Signup-Secret
+      header (constant-time compared), else 403.
+    - SIGNUP_SECRET unset + local dev → no-op, signup open (so you can create
+      the first account).
+    - SIGNUP_SECRET unset + looks deployed (Railway / APP_ENV env present) →
+      403. A public backend where the gate was never configured must fail
+      CLOSED, not sit open to the internet. Set SIGNUP_SECRET and retry with
+      the header to recover.
+    """
     if SIGNUP_SECRET is None:
+        if _DEPLOYED:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "Signup is disabled.")
         return
     if not x_signup_secret or not hmac.compare_digest(x_signup_secret, SIGNUP_SECRET):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Signup is disabled.")

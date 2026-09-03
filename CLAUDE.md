@@ -35,11 +35,12 @@
     and runs on **Railway**. Deploys are **`railway up` from the CLI**
     (uploads the build context) — NOT `git push`. This repo's Railway
     service is not wired to GitHub auto-deploy; a `git push` alone does
-    nothing until `railway up` runs. The Streamlit frontend is prepared
-    for **Streamlit Cloud** (env-driven `BACKEND_BASE_URL`, a slim
-    `requirements.txt`) but the deploy step is manual and not yet done.
-    No `supervisord`, no GitHub Actions pipeline — the two services
-    deploy independently.
+    nothing until `railway up` runs. The Streamlit frontend is deployed on
+    **Streamlit Cloud** at <https://habit-tracker-dimitri.streamlit.app/>
+    (env-driven `BACKEND_BASE_URL` app secret → the Railway backend, a slim
+    `requirements.txt`; Streamlit Cloud redeploys from the connected `main`
+    branch). No `supervisord`, no GitHub Actions pipeline — the two
+    services deploy independently.
   - The original plan routed through AWS then GCP; both were abandoned
     (GCP's org policies made public Cloud Run unworkable). Railway is the
     final answer.
@@ -88,7 +89,7 @@
   `langchain-chroma`. `langgraph-checkpoint-sqlite` kept (checkpointer
   fallback). Deploy: `Dockerfile` + `.dockerignore` + `requirements.txt`
   (Streamlit Cloud); Railway (backend), Neon (Postgres), Streamlit Cloud
-  (frontend, pending).
+  (frontend — <https://habit-tracker-dimitri.streamlit.app/>).
 - Phase 6: `langsmith` (≥0.12.1, tracing — bumped from 0.11.1),
   `slowapi` (in-memory rate limiting). The Haiku guardrail classifier
   uses the existing `langchain-anthropic`. Dev group (`[dependency-groups]
@@ -212,10 +213,13 @@
   `get_current_user_id` dependency. Leaf module, no import cycles. Reads
   `JWT_SECRET_KEY` at import time, fails fast if unset. Tokens expire in
   24h, no refresh flow.
-  - **Phase 6**: `require_signup_allowed` dependency — no-op when
-    `SIGNUP_SECRET` is unset (local dev, signup open); otherwise a signup
-    request must carry a matching `X-Signup-Secret` header
-    (`hmac.compare_digest`), else 403. `password_requirement_status` /
+  - **Phase 6**: `require_signup_allowed` dependency. `SIGNUP_SECRET` set →
+    the request must carry a matching `X-Signup-Secret` header
+    (`hmac.compare_digest`), else 403. `SIGNUP_SECRET` unset → **open only
+    in local dev**; if `_DEPLOYED` (`APP_ENV` / `RAILWAY_ENVIRONMENT*`
+    present — same signal as `_environment()`) it **fails CLOSED** (403), so
+    a public backend where the gate was never configured isn't silently
+    open to the internet. `password_requirement_status` /
     `is_strong_password` unchanged.
 - `src/main.py` — FastAPI app. The `lifespan` (Phase 5) does, in order:
   `_configure_request_logging()` (Phase 6 — correlation-id log filter) →
@@ -495,19 +499,21 @@
   `python src/main.py` fails on the relative imports). This is the image
   Railway builds.
 - `.dockerignore` — **Phase 5**. Keeps `.env`, `.venv/`, `evaluation/`,
-  local DB files, `deploy/` etc. out of the build context.
+  `tests/`, local DB files, `*.md` etc. out of the build context.
 - `requirements.txt` — **Phase 5**. Streamlit Cloud's dependency file —
   `streamlit`, `plotly`, `requests` ONLY. Do NOT add the backend stack;
   the frontend imports nothing else.
 - `run.sh` — starts backend + frontend together; port-based cleanup trap.
 
 # Architecture Notes
-- **Deployed:** FastAPI backend on **Railway** (Docker). Deploys are
-  `railway up` from the CLI — NOT `git push` (the service is not connected
-  to GitHub auto-deploy; a push alone changes nothing). One **Neon**
-  Postgres database; Streamlit frontend headed for **Streamlit Cloud**
-  (not yet deployed). Telegram reaches the backend by webhook. No AWS, no
-  GCP, no `supervisord`, no CI pipeline.
+- **Deployed:** FastAPI backend on **Railway** (Docker,
+  <https://distinguished-empathy-production-4c6b.up.railway.app>). Deploys
+  are `railway up` from the CLI — NOT `git push` (the service is not
+  connected to GitHub auto-deploy; a push alone changes nothing). One
+  **Neon** Postgres database. Streamlit frontend on **Streamlit Cloud**
+  (<https://habit-tracker-dimitri.streamlit.app/>), `BACKEND_BASE_URL`
+  app-secret → the Railway backend. Telegram reaches the backend by
+  webhook. No AWS, no GCP, no `supervisord`, no CI pipeline.
 - **Observability (Phase 6.1):** LangSmith tracing, project
   `"habit-tracker"`, enabled purely by env (`LANGSMITH_TRACING` /
   `_API_KEY` / `_PROJECT`). LangChain auto-traces the agent graph; the
@@ -750,20 +756,20 @@
   on the cap — the friction paths record without blocking. PII masking is
   a regex heuristic — it will miss unusual formats and can over-mask an
   odd bare 10-15 digit run.
-- **Deployment gaps:** the Streamlit frontend is prepared for Streamlit
-  Cloud but not actually deployed. `src/bot.py` is no longer runnable on
-  its own (`python -m src.bot` is a no-op) — local Telegram testing needs
-  a tunnel + `TELEGRAM_WEBHOOK_URL`. The `deploy/launchd/` scripts still
-  target the old always-on-Mac model and their `bot` service now runs
-  dead code — superseded by Railway. There is no `docker compose` for a
-  local Postgres; local dev uses the SQLite fallback or points at Neon.
+- **Local-dev notes (by design, not gaps):** `src/bot.py` is no longer
+  runnable on its own (`python -m src.bot` is a no-op) — local Telegram
+  testing needs a tunnel + `TELEGRAM_WEBHOOK_URL`. There is no
+  `docker compose` for a local Postgres; local dev uses the SQLite
+  fallback or points at Neon. (The old `deploy/launchd/` always-on-Mac
+  stack was deleted — superseded by Railway.)
 - Neon free tier suspends the compute after ~5 min idle — the first
   request after idle pays a ~0.5s reconnect (the pool's `check` handles
   the stale connection).
 - Rate limiting and the Telegram sliding window are **in-memory /
   per-process** — correct for the single Railway instance, but a
   horizontally-scaled deploy would need a shared store (Redis).
-- `/auth/signup` is gated by `SIGNUP_SECRET` in deployment, but stays
-  fully open whenever that var is unset (local dev, or a misconfigured
-  deploy).
+- `/auth/signup` is open only in **local dev** (no `SIGNUP_SECRET`, no
+  deployment env vars). On a deployment it's gated by `SIGNUP_SECRET`, and
+  if that var is missing it fails CLOSED rather than open — see
+  `auth.require_signup_allowed`.
 

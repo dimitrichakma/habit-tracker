@@ -412,6 +412,34 @@ async def test_bot_handler_does_not_leak_exception_text():
     assert "went wrong on my end" in sent[0]
 
 
+# --- signup gate --------------------------------------------------
+
+
+def test_signup_gate(monkeypatch):
+    """require_signup_allowed: open for local dev, header-gated when the secret
+    is set, and — the fix — fail CLOSED on a deployment where the secret was
+    never configured (rather than silently open to the internet)."""
+    import src.auth as auth
+    from fastapi import HTTPException
+
+    # local dev, no secret -> open (so you can bootstrap the first account)
+    monkeypatch.setattr(auth, "SIGNUP_SECRET", None)
+    monkeypatch.setattr(auth, "_DEPLOYED", False)
+    assert auth.require_signup_allowed(x_signup_secret=None) is None
+
+    # looks deployed, secret forgotten -> 403, NOT open
+    monkeypatch.setattr(auth, "_DEPLOYED", True)
+    with pytest.raises(HTTPException) as exc:
+        auth.require_signup_allowed(x_signup_secret=None)
+    assert exc.value.status_code == 403
+
+    # secret set -> header must match
+    monkeypatch.setattr(auth, "SIGNUP_SECRET", "s3cr3t")
+    assert auth.require_signup_allowed(x_signup_secret="s3cr3t") is None
+    with pytest.raises(HTTPException):
+        auth.require_signup_allowed(x_signup_secret="wrong")
+
+
 # --- agent timeout ---------------------------------------------
 
 

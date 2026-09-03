@@ -6,6 +6,9 @@ it in plain English ("did my 5k and read a chapter", "how am I doing this
 week"), and it logs the right habits, spots slipping patterns, and follows
 up through Telegram.
 
+**Live:** <https://habit-tracker-dimitri.streamlit.app/> (Streamlit frontend
+→ FastAPI backend on Railway → Neon Postgres).
+
 ## Why this exists
 
 Most habit trackers are just checkbox apps. The interesting problem here was
@@ -274,8 +277,10 @@ variables are set through Railway, not committed — see `.env.example` for the
 full list, including the optional Phase 6 tracing / rate-limit / guardrail /
 budget knobs.
 
-The Streamlit frontend is prepared for **Streamlit Cloud** — it reads
-`BACKEND_BASE_URL` from app secrets and has its own slim `requirements.txt`.
+The Streamlit frontend is deployed on **Streamlit Cloud** at
+<https://habit-tracker-dimitri.streamlit.app/> — it reads `BACKEND_BASE_URL`
+(pointing at the Railway backend) from app secrets and has its own slim
+`requirements.txt`.
 
 Telegram delivers updates to `POST /webhook/telegram`; the backend registers
 the webhook on startup from `TELEGRAM_WEBHOOK_URL` and verifies every request
@@ -289,5 +294,5 @@ Feature-complete through Phase 6.
 - **Phase 2** — Telegram bot + daily 8pm reminder scheduler ✅
 - **Phase 3** — pattern-aware coaching, micro-commitments, standalone MCP server ✅
 - **Phase 4** — semantic memory (RAG) over weekly summaries + LLM-as-a-Judge evaluation suite ✅
-- **Phase 5** — SQLite → Neon Postgres + pgvector, Telegram polling → webhook, Docker packaging, deployed on Railway ✅
+- **Phase 5** — SQLite → Neon Postgres + pgvector, Telegram polling → webhook, Docker packaging; backend live on Railway, frontend on Streamlit Cloud ✅
 - **Phase 6** — LangSmith tracing + correlation ids, security layer (signup gate, rate limiting, headers), prompt-caching latency work, a real non-mocked pgvector integration test, AI guardrails (input/output safety classification), and an infrastructure gateway (size cap, PII masking, token budget, timeout, generic errors) ✅
