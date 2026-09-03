@@ -155,6 +155,28 @@ async def test_off_topic_gets_redirect(text):
     assert _final_text(messages) == agent_module._REFUSAL_OFF_TOPIC
 
 
+async def test_habit_progress_fragment_not_blocked():
+    """Regression: a bare progress update that names a tracked habit ("the
+    lesson isn't done yet") was being blocked as OffTopic. The classifier now
+    sees the user's habit names + recent turns, so it must reach the coach."""
+    session = database.get_session()
+    try:
+        session.add(database.User(username="frag_user", hashed_password="x"))
+        session.commit()
+        uid = session.query(database.User).filter_by(username="frag_user").first().id
+        session.add(database.Habit(user_id=uid, name="Skill development lesson", frequency="daily"))
+        session.commit()
+    finally:
+        session.close()
+
+    async with agent_module.build_agent() as agent:
+        result = await agent.ainvoke(
+            {"messages": [{"role": "user", "content": "skill development lesson is going on, not finished yet"}]},
+            config={"configurable": {"thread_id": str(uid)}},
+        )
+    assert _guardrail_meta(result["messages"]) is None, "a habit progress update was blocked"
+
+
 # --- fail safe: a classifier failure blocks, never opens ------------------
 
 async def test_classifier_failure_fails_safe(monkeypatch):

@@ -175,11 +175,21 @@
     `_INJECTION_PATTERNS` regex pre-filter runs first (a hit →
     `PromptInjection`, classifier skipped), then a Claude Haiku
     classifier (`CLASSIFIER_MODEL`, `.with_structured_output`) tags
-    `Safe` / `PromptInjection` / `HarmfulBehavior` / `OffTopic`. A
-    flagged turn jumps to end with a canned refusal (neutral for
-    injection, friendly redirect for off-topic, genuinely caring +
-    `HARM_SUPPORT_RESOURCE` for harmful behavior) — the worker model
-    never sees it. Output: `_LEAK_PATTERNS` / `_PRESCRIPTION_PATTERNS`
+    `Safe` / `PromptInjection` / `HarmfulBehavior` / `OffTopic`. The
+    classifier is handed the **user's habit names**
+    (`_known_habit_names`, one quick SQL query via `get_config()`'s
+    thread_id) **and the last ~4 turns** (`_classifier_context`), so a
+    mid-conversation habit update ("the lesson isn't done yet") isn't
+    read as off-topic in a vacuum — that false-positive is why the
+    context was added. `PromptInjection` / `HarmfulBehavior` block at any
+    confidence; **`OffTopic` only hard-blocks at confidence ≥
+    `OFF_TOPIC_BLOCK_CONFIDENCE` (0.85)** — below that the message passes
+    and the coach redirects it in its own reply (tagged
+    `guardrail_offtopic_allowed`). A blocked turn jumps to end with a
+    canned refusal (neutral for injection, friendly redirect for
+    off-topic, genuinely caring + `HARM_SUPPORT_RESOURCE` for harmful
+    behavior) — the worker model never sees it. Output:
+    `_LEAK_PATTERNS` / `_PRESCRIPTION_PATTERNS`
     regex always run, then an optional Haiku semantic check
     (`GUARDRAIL_OUTPUT_LLM_CHECK`); a flagged reply is swapped for
     `_OUTPUT_FALLBACK` (kept `id` → `add_messages` upsert). **Fails safe**
@@ -621,6 +631,8 @@
     1000000 on Railway** after a months-old thread hit the default in ~3
     turns; see `MAX_HISTORY_TOKENS`), `AGENT_TIMEOUT_SECONDS` (30).
     `GUARDRAIL_TIMEOUT_SECONDS` (8), `GUARDRAIL_OUTPUT_LLM_CHECK` (on),
+    `OFF_TOPIC_BLOCK_CONFIDENCE` (0.85) — min classifier confidence to
+    hard-block an OffTopic input; below it the coach redirects it itself.
     `HARM_SUPPORT_RESOURCE` (override the support-resource text in the
     harmful-behavior refusal). `WORKER_EFFORT` (`medium`) — adaptive-thinking
     depth for the coaching model; `low`/`medium`/`high`. `MAX_HISTORY_TOKENS`
@@ -713,6 +725,13 @@
   SAFE (block / replace), never open. Don't put a `Field(max_length=…)`
   on an LLM free-text output field — the model overruns it and structured
   parsing throws (this already caused a fail-safe on a good reply once).
+  The input classifier gets the user's habit names + recent turns as
+  context (a bare fragment like "not done yet" was being blocked as
+  OffTopic); `OffTopic` only hard-blocks at confidence ≥
+  `OFF_TOPIC_BLOCK_CONFIDENCE` — `PromptInjection`/`HarmfulBehavior`
+  block at any confidence. Keep that asymmetry: an off-topic message
+  reaching the coach is harmless (it redirects); a blocked habit update
+  frustrates the one user.
 - **The gateway (Phase 6) covers exactly the two agent entry points —
   `/chat` and the Telegram webhook.** `/evaluate_friction` and the
   scheduled nudge are out of its path by design (no size cap / masking /
