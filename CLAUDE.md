@@ -636,6 +636,12 @@
   `ANTHROPIC_API_KEY` + `OPENAI_API_KEY` (does NOT need `DATABASE_URL` — it
   mocks retrieval and uses a throwaway SQLite). Transient `529 Overloaded`
   from Anthropic can fail a case on the judge — retry that case.
+  - **This is the ONLY thing in the project that calls `claude-opus-5`, and
+    it's the most expensive run by far (~$1.50-3, ~40-60 Opus 5 calls). Do
+    NOT run it as routine post-change verification** — reserve it for a
+    phase boundary / release check, and ask first. For routine checks after
+    a change use `test_guardrails.py` + `test_gateway_security.py` below,
+    which cover most regressions at a fraction of the cost.
 - Run the guardrail suite: `uv run pytest evaluation/test_guardrails.py`
   — real Anthropic (Haiku classifier + Sonnet worker on the pass-through
   cases). Throwaway SQLite; no `DATABASE_URL`.

@@ -35,3 +35,6 @@ temp_test_run_data.json
 
 # exported phase docs (personal, not for the repo)
 docs/*.pdf
+
+# macOS
+.DS_Store
