@@ -11,7 +11,7 @@ import os
 import re
 from datetime import date, datetime, timedelta
 
-from sqlalchemy import Date, DateTime, ForeignKey, String, UniqueConstraint, create_engine, text
+from sqlalchemy import Date, DateTime, ForeignKey, String, UniqueConstraint, create_engine, inspect, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
@@ -84,6 +84,15 @@ class Habit(Base):
     name: Mapped[str] = mapped_column(String, nullable=False)
     frequency: Mapped[str] = mapped_column(String, nullable=False)
 
+    # Structured reading of `frequency`, filled once at creation by
+    # schedule_classifier.classify_frequency (a TypeSafe judgment call) — see
+    # that module's docstring. NULL means "not classified" (pre-migration
+    # habit, or the classifier didn't confidently resolve it): _excluded_weekday
+    # falls back to a regex parse of `frequency` in that case. Never written
+    # to directly outside create_new_habit.
+    schedule_type: Mapped[str | None] = mapped_column(String, nullable=True)
+    excluded_weekday: Mapped[str | None] = mapped_column(String, nullable=True)
+
     logs: Mapped[list["HabitLog"]] = relationship(back_populates="habit", cascade="all, delete-orphan")
 
 
@@ -132,6 +141,7 @@ def init_db() -> None:
     Base.metadata.create_all(bind=engine)
     if engine.dialect.name == "sqlite":
         _migrate_add_habits_user_id()
+    _migrate_add_habits_schedule_columns()
 
 
 def _migrate_add_habits_user_id() -> None:
@@ -150,6 +160,26 @@ def _migrate_add_habits_user_id() -> None:
         if "user_id" not in columns:
             conn.exec_driver_sql("ALTER TABLE habits ADD COLUMN user_id INTEGER REFERENCES users(id)")
             conn.commit()
+
+
+def _migrate_add_habits_schedule_columns() -> None:
+    """Additive migration: adds habits.schedule_type / excluded_weekday
+    (nullable) for the TypeSafe-backed structured schedule (see
+    schedule_classifier.py). Runs on every startup on BOTH dialects — unlike
+    _migrate_add_habits_user_id, Postgres deployments predate this column
+    too, so this can't be SQLite-only. Uses SQLAlchemy's generic inspector
+    instead of PRAGMA/information_schema so one code path covers both.
+    Idempotent: checks existing columns first, always safe to call.
+    """
+    inspector = inspect(engine)
+    if "habits" not in inspector.get_table_names():
+        return  # fresh DB — create_all() above already created both columns
+    columns = {col["name"] for col in inspector.get_columns("habits")}
+    with engine.begin() as conn:
+        if "schedule_type" not in columns:
+            conn.execute(text("ALTER TABLE habits ADD COLUMN schedule_type VARCHAR"))
+        if "excluded_weekday" not in columns:
+            conn.execute(text("ALTER TABLE habits ADD COLUMN excluded_weekday VARCHAR"))
 
 
 def backfill_orphaned_habits(session: Session, owner_user_id: int) -> int:
@@ -244,9 +274,15 @@ def record_token_usage(user_id: int, day: date, input_tokens: int, output_tokens
 _WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
 
 
-def _excluded_weekday(frequency: str) -> str | None:
-    """Extract a weekday named in an "except <Weekday>" clause, if any."""
-    match = re.search(r"except\s+(\w+)", frequency, re.IGNORECASE)
+def _excluded_weekday(habit: Habit) -> str | None:
+    """The weekday this habit skips, if any. Prefers the structured
+    `excluded_weekday` column (a TypeSafe judgment made once at creation —
+    see schedule_classifier.py); falls back to a regex read of the raw
+    `frequency` string when `schedule_type` is NULL (a pre-migration habit,
+    or one the classifier didn't confidently resolve)."""
+    if habit.schedule_type is not None:
+        return habit.excluded_weekday
+    match = re.search(r"except\s+(\w+)", habit.frequency, re.IGNORECASE)
     if match and match.group(1).lower() in _WEEKDAYS:
         return match.group(1).lower()
     return None
@@ -254,7 +290,7 @@ def _excluded_weekday(frequency: str) -> str | None:
 
 def is_due_today(habit: Habit, today: date) -> bool:
     """Whether this habit is applicable today (not skipped by an "except <Weekday>" clause)."""
-    excluded = _excluded_weekday(habit.frequency)
+    excluded = _excluded_weekday(habit)
     return excluded != _WEEKDAYS[today.weekday()]
 
 

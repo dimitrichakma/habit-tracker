@@ -4,13 +4,18 @@ Each tool opens its own DB session and executes queries directly against
 SQLite via SQLAlchemy — no data is ever guessed by the agent.
 """
 
+import logging
 from datetime import date, timedelta
 
 from langchain.tools import ToolRuntime
 from langchain_core.tools import tool
 
 from .database import Habit, HabitLog, get_session, is_due_today, is_satisfied, satisfaction_window_days
+from .schedule_classifier import classify_frequency
+from .typesafe_client import get_typesafe_client
 from .vector_store import get_habit_memory_store
+
+logger = logging.getLogger(__name__)
 
 
 def _current_user_id(runtime: ToolRuntime) -> int:
@@ -49,11 +54,60 @@ _WEEKDAY_LABELS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Satu
 _PATTERN_LOOKBACK_DAYS = 42  # six weeks — enough to see a weekday-level pattern
 
 
+_HABIT_MATCH_CONFIDENCE = 0.6
+_NO_MATCH = object()  # sentinel: TypeSafe confidently found no match — don't fall through to substring
+
+
+def _typesafe_resolve_habit(habit_name: str, habits: list[Habit]):
+    """Ask TypeSafe which of the user's existing habits `habit_name` refers
+    to, by meaning rather than literal word overlap (e.g. "workout" ->
+    "Gym in the Evening (except Friday)", which the substring heuristic
+    below can't reach). Returns a Habit on a confident match, `_NO_MATCH`
+    on a confident "none", or None (unresolved) when the call fails or
+    lands below `_HABIT_MATCH_CONFIDENCE` — callers fall back to the
+    substring heuristic in either of those last two cases, i.e. exactly
+    today's behavior if TypeSafe is unavailable or unsure."""
+    try:
+        from typesafe_sdk import Choice
+
+        by_name = {habit.name: habit for habit in habits}
+        criteria = {name: None for name in by_name}
+        criteria["none"] = "habit_name doesn't clearly match any of the listed habits"
+
+        client = get_typesafe_client()
+        result = client.system_one(
+            {"habit_name": habit_name, "existing_habits": list(by_name)},
+            {
+                "matched_habit": Choice(
+                    instructions=(
+                        "The user referred to a habit as `habit_name`. Which entry in "
+                        "`existing_habits` are they most likely talking about — by "
+                        "meaning, not literal word overlap?"
+                    ),
+                    criteria=criteria,
+                ),
+            },
+        )
+    except Exception:
+        logger.warning(
+            "TypeSafe habit-name resolution failed — falling back to substring match.", exc_info=True
+        )
+        return None
+
+    answer = result.choices["matched_habit"]
+    if answer.confidence < _HABIT_MATCH_CONFIDENCE:
+        return None
+    if answer.choice == "none":
+        return _NO_MATCH
+    return by_name.get(answer.choice)
+
+
 def _find_habit(session, habit_name: str, user_id: int) -> Habit | list[Habit] | None:
-    """Look up a habit (scoped to user_id) by exact name, falling back to a
-    case-insensitive substring match (either direction) if nothing matches
-    exactly — so shorthand like "gym" can still resolve to "Gym in the
-    Evening (except Friday)" instead of silently spawning a duplicate habit.
+    """Look up a habit (scoped to user_id) by exact name, then a TypeSafe
+    meaning-based match (_typesafe_resolve_habit), then a case-insensitive
+    substring match (either direction) as the final fallback — so shorthand
+    like "gym" or "workout" can still resolve to "Gym in the Evening (except
+    Friday)" instead of silently spawning a duplicate habit.
 
     Returns a single Habit on a clean match, a list of candidates when the
     fuzzy match is ambiguous (more than one), or None when nothing matches.
@@ -65,8 +119,19 @@ def _find_habit(session, habit_name: str, user_id: int) -> Habit | list[Habit] |
     needle = habit_name.strip().lower()
     if not needle:
         return None
+
+    habits = session.query(Habit).filter(Habit.user_id == user_id).all()
+    if not habits:
+        return None
+
+    resolved = _typesafe_resolve_habit(habit_name, habits)
+    if resolved is _NO_MATCH:
+        return None
+    if resolved is not None:
+        return resolved
+
     candidates = [
-        habit for habit in session.query(Habit).filter(Habit.user_id == user_id).all()
+        habit for habit in habits
         if needle in habit.name.lower() or habit.name.lower() in needle
     ]
     if len(candidates) == 1:
@@ -91,7 +156,14 @@ def create_new_habit(name: str, frequency: str, *, runtime: ToolRuntime) -> str:
         if existing is not None:
             return f"A habit named '{name}' already exists."
 
-        habit = Habit(name=name, frequency=frequency, user_id=user_id)
+        structured = classify_frequency(frequency)
+        habit = Habit(
+            name=name,
+            frequency=frequency,
+            schedule_type=structured["schedule_type"] if structured else None,
+            excluded_weekday=structured["excluded_weekday"] if structured else None,
+            user_id=user_id,
+        )
         session.add(habit)
         session.commit()
         return f"Created habit '{name}' with frequency '{frequency}'."

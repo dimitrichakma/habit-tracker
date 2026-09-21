@@ -29,6 +29,7 @@ dependencies = [
     "slowapi>=0.1.10",
     "sqlalchemy>=2.0.52",
     "streamlit>=1.62.0",
+    "typesafe-sdk>=0.7.0",
     "uvicorn>=0.52.4",
 ]
 

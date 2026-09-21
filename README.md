@@ -101,9 +101,14 @@ Streamlit Cloud            Telegram  --webhook-->  ┌────────�
   dev falls back to SQLite when `DATABASE_URL` is unset.
 - **pgvector** - weekly behavioral summaries as searchable vectors, wrapped
   behind a single module (`vector_store.py`). Claude writes the summaries;
-  OpenAI's `text-embedding-3-small` embeds them (the only non-Claude model
-  call in the app). Migrated from ChromaDB in Phase 5 without touching the
-  agent or the tests.
+  OpenAI's `text-embedding-3-small` embeds them. Migrated from ChromaDB in
+  Phase 5 without touching the agent or the tests.
+- **TypeSafe (System One / Jev)** - two bounded judgment calls outside the
+  agent entirely: resolving a loosely-phrased habit name (`tools.py`) and
+  structuring a frequency phrase into a schedule at creation time
+  (`schedule_classifier.py`). Both fail soft to their pre-TypeSafe
+  behavior. Claude still does every model call that generates or judges
+  agent-facing text.
 - **Streamlit** - chat UI, Today's Dashboard, and Plotly progress charts.
   HTTP-only; reads its backend URL from `BACKEND_BASE_URL`. The chat replies
   stream in over Server-Sent Events (`POST /chat/stream`) with a status line
@@ -141,6 +146,14 @@ Streamlit Cloud            Telegram  --webhook-->  ┌────────�
   that generates or judges text is Claude. OpenAI is used for one thing -
   turning summary text into embedding vectors - because that's a
   numeric-similarity task, not a reasoning one.
+- **Judgment for data entry, not for the agent.** Two spots that used to be
+  fragile regex/substring code - resolving a loosely-phrased habit name, and
+  structuring a freeform frequency string into a schedule - now make a
+  bounded TypeSafe (System One) call instead. It's scoped narrowly on
+  purpose: nothing the user sees generated, nothing judged or classified for
+  safety - that's still Claude-only, unchanged. Both calls fail soft to
+  their pre-TypeSafe behavior if the API is unset or errors, so the feature
+  degrades, it never breaks habit creation or logging.
 - **The agent is measured, not vibe-checked.** A golden dataset plus an
   LLM-as-a-Judge suite grades each release: retrieval is mocked so the tests
   survive a future vector-store swap unchanged, and the judge is a stronger
@@ -213,11 +226,11 @@ is why the Phase 5 ChromaDB → pgvector migration didn't touch it at all.
 ## Tech stack
 
 Python, FastAPI, LangChain / LangGraph, Anthropic Claude, SQLAlchemy,
-PostgreSQL (Neon) + pgvector, OpenAI embeddings, Streamlit, Plotly,
-python-telegram-bot (webhook), APScheduler, JWT (PyJWT), bcrypt, MCP,
-LangSmith (tracing), slowapi (rate limiting), DeepEval, pytest,
-testcontainers. Deployed on Railway (backend) + Streamlit Cloud
-(frontend); containerized with a `Dockerfile`.
+PostgreSQL (Neon) + pgvector, OpenAI embeddings, TypeSafe (System One),
+Streamlit, Plotly, python-telegram-bot (webhook), APScheduler, JWT
+(PyJWT), bcrypt, MCP, LangSmith (tracing), slowapi (rate limiting),
+DeepEval, pytest, testcontainers. Deployed on Railway (backend) +
+Streamlit Cloud (frontend); containerized with a `Dockerfile`.
 
 ## Running it locally
 
@@ -321,7 +334,7 @@ against `WEBHOOK_SECRET_TOKEN`.
 
 ## Status
 
-Feature-complete through Phase 6.
+Feature-complete through Phase 7.
 
 - **Phase 1** — core chat, Today's Dashboard, JWT auth, Plotly progress charts ✅
 - **Phase 2** — Telegram bot + daily 8pm reminder scheduler ✅
@@ -330,3 +343,4 @@ Feature-complete through Phase 6.
 - **Phase 5** — SQLite → Neon Postgres + pgvector, Telegram polling → webhook, Docker packaging; backend live on Railway, frontend on Streamlit Cloud ✅
 - **Phase 6** — LangSmith tracing + correlation ids, security layer (signup gate that fails *closed* on a deployment, rate limiting, headers), latency work (worker thinking capped to `medium`, 1-hour prompt-cache TTL, history-trimming middleware), a real non-mocked pgvector integration test, AI guardrails (input/output safety classification, context-aware with an asymmetric block policy), and an infrastructure gateway (size cap, PII masking, token budget covering the guardrail classifiers too, timeout, generic errors) ✅
   - Post-launch fixes from production traces: three messages on a months-old thread blew the 200k daily token cap → history trimming + a higher quota + thread cleanup; the off-topic classifier blocked a real habit update → habit-name/recent-turn context + soft-blocking below `OFF_TOPIC_BLOCK_CONFIDENCE`; `bot.py` stopped echoing raw exception text to Telegram; `deepeval` / `pytest` moved to the dev dependency group so `uv sync --no-dev` drops them from the Railway image; the web chat now streams (SSE) with a per-tool status line instead of a blocking spinner; the evening friction nudge — the agent's heaviest turn — was cut from 3–5 worker calls to 1 by pre-computing each habit's history pattern in Python and running it on a throwaway thread.
+- **Phase 7** — replaced two fragile parsing spots with a bounded TypeSafe (System One) judgment call: `tools._find_habit` now resolves a loosely-phrased habit name by meaning (falling back to the old substring match if TypeSafe is unset or unsure), and `create_new_habit` structures the frequency phrase once at creation time into `Habit.schedule_type`/`excluded_weekday`, so `is_due_today`/`is_satisfied` stay pure deterministic reads. Both fail soft to pre-Phase-7 behavior; TypeSafe never generates or judges agent-facing text — that stays Claude-only ✅

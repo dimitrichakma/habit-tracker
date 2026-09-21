@@ -71,6 +71,14 @@
     PII masking, a daily token budget (`token_usage` table), a generic
     catch-all error handler, and a hard timeout on the agent call. See
     `src/main.py`'s gateway section.
+- Phase 7 (complete): two fragile-parsing spots upgraded to a bounded
+  TypeSafe (System One / Jev) judgment call instead of regex/substring
+  heuristics — `tools._find_habit` (meaning-based habit-name resolution)
+  and `schedule_classifier.classify_frequency` (freeform frequency phrase
+  → structured `Habit.schedule_type`/`excluded_weekday`, called once at
+  `create_new_habit` time, never on the `is_due_today`/`is_satisfied` hot
+  path). Both fail soft to their pre-Phase-7 behavior if TypeSafe is
+  unconfigured or errors — see Rules.
 
 # Tech Stack
 - Backend: FastAPI, LangGraph, LangChain (Anthropic), SQLAlchemy,
@@ -96,6 +104,11 @@
   dev`): `testcontainers[postgres]` (pgvector integration suite), plus
   `deepeval` / `pytest` / `pytest-asyncio` (moved out of runtime deps).
   No new runtime NLP deps — PII masking is plain `re`.
+- Phase 7: `typesafe-sdk` — TypeSafe's System One (Jev) client, used for two
+  bounded judgment calls that plain regex/substring code can't reliably
+  make: habit-name resolution (`tools._find_habit`) and frequency-phrase
+  structuring (`schedule_classifier.py`). Not a Claude/OpenAI replacement —
+  see the Rules section for exactly where the provider-split boundary sits.
 - Package manager: uv
 - `create_agent` lives in `langchain.agents`, not `langchain-anthropic`
 
@@ -111,7 +124,15 @@
     `connect_args={"prepare_threshold": None}` so the SAME url works on
     Neon's POOLED (PgBouncer / `-pooler`) endpoint.
   - `User(id, username, hashed_password)`; `Habit(id, user_id FK, name,
-    frequency)`; `HabitLog(id, habit_id, date, status)`.
+    frequency, schedule_type, excluded_weekday)`; `HabitLog(id, habit_id,
+    date, status)`. `schedule_type`/`excluded_weekday` (**Phase 7**,
+    nullable) are the structured reading of `frequency`, filled once by
+    `schedule_classifier.classify_frequency` at creation — NULL means
+    "not classified," and `_excluded_weekday` falls back to its legacy
+    regex parse of `frequency` in that case. `_migrate_add_habits_schedule_columns()`
+    adds both columns additively on EITHER dialect (unlike the SQLite-only
+    `_migrate_add_habits_user_id`, since Postgres deployments predate
+    this column too).
   - `TokenUsage(id, user_id FK, usage_date, input_tokens, output_tokens)`
     — **Phase 6**. One row per `(user_id, usage_date)` (unique), the
     daily token-budget ledger. `daily_token_total(user_id, day)` sums it
@@ -131,7 +152,11 @@
   - `is_due_today()` / `is_satisfied()` — single source of truth for
     frequency logic (rolling 7-day "weekly", skip "except <Weekday>",
     `status=="done"`-only). Used everywhere pending/satisfied status is
-    checked — never reimplement locally.
+    checked — never reimplement locally. Pure code, no runtime model
+    calls — `_excluded_weekday()` reads the structured `schedule_type`/
+    `excluded_weekday` columns when set (**Phase 7**), regex on `frequency`
+    otherwise. Never call TypeSafe from here; classification happens once,
+    at creation time, in `tools.create_new_habit`.
 - `src/tools.py` — LangChain `@tool` functions.
   - Every tool scoped via keyword-only `*, runtime: ToolRuntime` →
     resolves user from `runtime.config["configurable"]["thread_id"]`. No
@@ -140,7 +165,10 @@
   - `create_new_habit`, `get_pending_habits`, `list_habits`,
     `log_habit(name, status, log_date="today"|"yesterday"|"YYYY-MM-DD")`,
     `get_weekly_summary`, `delete_habit` (exact match, cascades, agent
-    confirms first).
+    confirms first). **Phase 7:** `create_new_habit` also calls
+    `schedule_classifier.classify_frequency(frequency)` once and stores
+    its result (or NULLs on a soft failure) on the new `Habit` columns —
+    see `database.py`'s Habit entry above.
   - `get_habit_history_pattern(habit_name)` — **Phase 3**. Plain-text
     pattern summary from `HabitLog` history (e.g. "missed 4 of last 5
     Mondays"), pure SQL, no schema change. The tool is a thin wrapper
@@ -155,8 +183,26 @@
     `habit_summaries` collection, filtered to the caller's own `user_id`
     (via `ToolRuntime`, same as every other tool — never an LLM-supplied
     value). Returns top 3 matches. Unchanged by Phase 5.
-  - Name resolution via `_find_habit`: exact → case-insensitive substring
-    → asks to disambiguate on multiple matches.
+  - Name resolution via `_find_habit`: exact → **Phase 7:** a TypeSafe
+    meaning-based match (`_typesafe_resolve_habit`, confidence-gated at
+    `_HABIT_MATCH_CONFIDENCE`) → case-insensitive substring (either
+    direction) → asks to disambiguate on multiple matches. TypeSafe
+    unavailable/unsure falls straight through to the substring step —
+    i.e. exactly pre-Phase-7 behavior, never a hard failure.
+- `src/typesafe_client.py` — **Phase 7.** One shared, lazily-built
+  `TypeSafeClient` (`@lru_cache`), reading `TYPESAFE_API_KEY`. The only
+  file that constructs a TypeSafe client — `schedule_classifier.py` and
+  `tools.py`'s `_typesafe_resolve_habit` both call `get_typesafe_client()`
+  rather than instantiating their own.
+- `src/schedule_classifier.py` — **Phase 7.** `classify_frequency(frequency_text)`
+  → `{"schedule_type", "excluded_weekday"} | None`, a single TypeSafe
+  `Choice`-question call, used only by `tools.create_new_habit` at habit
+  creation time. Fails soft: low confidence, `schedule_type == "other"`,
+  or any API error all return `None`, which the caller stores as NULL on
+  both `Habit` columns — `database._excluded_weekday` then falls back to
+  its legacy regex parse. Deliberately out of scope for now: `n_per_week`
+  ("3 times a week") — `is_satisfied` has no target-count logic to act on
+  it yet, so it isn't classified.
 - `src/agent.py` — built via `langchain.agents.create_agent` (never the
   deprecated `langgraph.prebuilt.create_react_agent`).
   - Model: `ChatAnthropic(model="claude-sonnet-5",
@@ -695,6 +741,10 @@
     (`trim_history` middleware); bounds the per-turn cost of an old thread.
     `TEST_DATABASE_URL` — scratch DB for `tests/` (must differ from
     `DATABASE_URL`).
+  - **Phase 7**, optional: `TYPESAFE_API_KEY` — powers `_find_habit`'s
+    meaning-based habit match and `classify_frequency`'s schedule
+    structuring. Unset or invalid → both fail soft to pre-Phase-7
+    behavior (see Rules); never required for the app to run.
 - **Checkpointer uses Neon's DIRECT endpoint; everything else uses the
   POOLED endpoint.** `postgres_checkpointer()` runs server-side prepared
   statements (`prepare_threshold=0`) that PgBouncer transaction pooling
@@ -713,6 +763,15 @@
   `langchain-openai` depends on it; `deepeval`, which also pulls `openai`,
   is dev-only now). Do not route any generation, judging, or classification
   through OpenAI — including in error/fallback paths.
+  - **Phase 7 carve-out:** `typesafe-sdk` (Jev/System One) is used for
+    exactly two bounded, non-agent-facing judgment calls —
+    `tools._typesafe_resolve_habit` (which existing habit a loosely-phrased
+    name refers to) and `schedule_classifier.classify_frequency`
+    (structuring a frequency phrase at creation time). Neither generates
+    text the user sees, judges the coach's output, or makes a safety
+    decision — those stay Claude-only per the rule above. Don't widen
+    TypeSafe's footprint into guardrail classification, coaching replies,
+    or anything `evaluation/` judges without discussing it first.
 - Tools derive the acting user only from `runtime` (ToolRuntime), never
   an LLM-supplied argument.
 - `app.py`: no LangChain/LangGraph/DB logic, HTTP only. `bot.py`: no
@@ -772,6 +831,15 @@
   `tests/test_vector_store_integration.py` (Phase 6) — the eval suite
   still mocks retrieval on purpose. Never run either against the real
   `DATABASE_URL`.
+- **TypeSafe calls (Phase 7) must fail soft, never hard.** Both callers
+  (`tools._typesafe_resolve_habit`, `schedule_classifier.classify_frequency`)
+  wrap the call in a broad `try/except`, log a warning, and return `None`
+  on ANY failure (missing/invalid `TYPESAFE_API_KEY`, timeout, low
+  confidence) — the caller then runs exactly its pre-Phase-7 logic
+  (substring match / regex parse). TypeSafe being down must never break
+  habit creation or logging. Don't add a confidence threshold without
+  reasoning about what a wrong "confident" answer costs the user, the
+  same way `OFF_TOPIC_BLOCK_CONFIDENCE` was tuned.
 - **Guardrails (Phase 6) live as `create_agent` middleware, never a
   hand-built `StateGraph`** — the `AsyncPostgresSaver` checkpointer
   persists at node boundaries, and a bespoke graph would fight that.
