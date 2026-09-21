@@ -9,6 +9,7 @@ from datetime import date, timedelta
 
 from langchain.tools import ToolRuntime
 from langchain_core.tools import tool
+from langsmith import traceable
 
 from .database import Habit, HabitLog, get_session, is_due_today, is_satisfied, satisfaction_window_days
 from .schedule_classifier import classify_frequency
@@ -58,6 +59,34 @@ _HABIT_MATCH_CONFIDENCE = 0.6
 _NO_MATCH = object()  # sentinel: TypeSafe confidently found no match — don't fall through to substring
 
 
+def _scrub_resolve_habit_inputs(inputs: dict) -> dict:
+    """LangSmith records the phrase and the candidate habit names only —
+    never the full ORM `Habit` objects (not JSON-serializable anyway, and
+    nothing else on them is relevant to this judgment)."""
+    habits = inputs.get("habits") or []
+    return {
+        "habit_name": inputs.get("habit_name"),
+        "existing_habits": [h.name for h in habits],
+    }
+
+
+def _scrub_resolve_habit_outputs(output) -> dict:
+    """The return value is a raw Habit ORM object, the `_NO_MATCH` sentinel,
+    or None — none of which LangSmith can serialize directly. Record just
+    what's useful for reading a trace: which name (if any) it resolved to."""
+    if output is _NO_MATCH:
+        return {"matched_habit": "none"}
+    if output is None:
+        return {"matched_habit": None}
+    return {"matched_habit": output.name}
+
+
+@traceable(
+    run_type="chain",
+    name="tools._typesafe_resolve_habit",
+    process_inputs=_scrub_resolve_habit_inputs,
+    process_outputs=_scrub_resolve_habit_outputs,
+)
 def _typesafe_resolve_habit(habit_name: str, habits: list[Habit]):
     """Ask TypeSafe which of the user's existing habits `habit_name` refers
     to, by meaning rather than literal word overlap (e.g. "workout" ->

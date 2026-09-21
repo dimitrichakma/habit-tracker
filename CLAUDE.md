@@ -185,15 +185,22 @@
     value). Returns top 3 matches. Unchanged by Phase 5.
   - Name resolution via `_find_habit`: exact → **Phase 7:** a TypeSafe
     meaning-based match (`_typesafe_resolve_habit`, confidence-gated at
-    `_HABIT_MATCH_CONFIDENCE`) → case-insensitive substring (either
-    direction) → asks to disambiguate on multiple matches. TypeSafe
-    unavailable/unsure falls straight through to the substring step —
-    i.e. exactly pre-Phase-7 behavior, never a hard failure.
+    `_HABIT_MATCH_CONFIDENCE`, `@traceable` with inputs/outputs scrubbed to
+    the habit name(s) only — never the raw ORM objects) → case-insensitive
+    substring (either direction) → asks to disambiguate on multiple
+    matches. TypeSafe unavailable/unsure falls straight through to the
+    substring step — i.e. exactly pre-Phase-7 behavior, never a hard failure.
 - `src/typesafe_client.py` — **Phase 7.** One shared, lazily-built
   `TypeSafeClient` (`@lru_cache`), reading `TYPESAFE_API_KEY`. The only
   file that constructs a TypeSafe client — `schedule_classifier.py` and
   `tools.py`'s `_typesafe_resolve_habit` both call `get_typesafe_client()`
-  rather than instantiating their own.
+  rather than instantiating their own. Plain `typesafe-sdk`, not the
+  `langchain-typesafe` integration package — that's alpha (`0.0.1a3`,
+  its own docs flag the bundled agent middleware as unstable), pulls in
+  a second HTTP stack (`httpx2`) and a `langchain-core` version floor,
+  and its main value (LCEL `Runnable` composability) isn't used here —
+  both call sites are plain functions outside the agent graph, same as
+  `describe_habit_pattern`. Revisit once it's past alpha.
 - `src/schedule_classifier.py` — **Phase 7.** `classify_frequency(frequency_text)`
   → `{"schedule_type", "excluded_weekday"} | None`, a single TypeSafe
   `Choice`-question call, used only by `tools.create_new_habit` at habit
@@ -202,7 +209,9 @@
   both `Habit` columns — `database._excluded_weekday` then falls back to
   its legacy regex parse. Deliberately out of scope for now: `n_per_week`
   ("3 times a week") — `is_satisfied` has no target-count logic to act on
-  it yet, so it isn't classified.
+  it yet, so it isn't classified. Carries `@traceable` (`process_inputs`
+  scrubbed to just the phrase) so it shows up in LangSmith like the
+  vector-store/summarizer calls — Phase 6.1's non-graph-helper pattern.
 - `src/agent.py` — built via `langchain.agents.create_agent` (never the
   deprecated `langgraph.prebuilt.create_react_agent`).
   - Model: `ChatAnthropic(model="claude-sonnet-5",

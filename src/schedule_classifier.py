@@ -17,6 +17,8 @@ outage never breaks habit creation or produces a wrong schedule.
 
 import logging
 
+from langsmith import traceable
+
 from .typesafe_client import get_typesafe_client
 
 logger = logging.getLogger(__name__)
@@ -40,6 +42,17 @@ _SCHEDULE_TYPE_CRITERIA = {
 }
 
 
+def _scrub_classify_frequency_inputs(inputs: dict) -> dict:
+    """LangSmith records only the frequency phrase — the only argument
+    this function takes, and nothing sensitive."""
+    return {"frequency_text": inputs.get("frequency_text")}
+
+
+@traceable(
+    run_type="chain",
+    name="schedule_classifier.classify_frequency",
+    process_inputs=_scrub_classify_frequency_inputs,
+)
 def classify_frequency(frequency_text: str) -> dict | None:
     """Returns {"schedule_type", "excluded_weekday"} or None (see module
     docstring for what None means to the caller)."""
