@@ -79,6 +79,26 @@ st.markdown(
         padding: 0.75rem 1rem 0.5rem;
     }
 
+    /* Streamlit's dark theme (browser/OS prefers-color-scheme) makes the
+       light-mode colors above unreadable — the sidebar background and chat
+       bubbles need dark-appropriate counterparts, not just "no color". */
+    @media (prefers-color-scheme: dark) {
+        section[data-testid="stSidebar"] {
+            background-color: #1c1f26;
+            border-right: 1px solid #333844;
+        }
+        [data-testid="stChatMessage"]:has(div[data-testid="chatAvatarIcon-user"]) {
+            background-color: #1d2f47;
+        }
+        [data-testid="stChatMessage"]:has(div[data-testid="chatAvatarIcon-assistant"]) {
+            background-color: #23262e;
+        }
+        [data-testid="stMetric"] {
+            background-color: #23262e;
+            border: 1px solid #333844;
+        }
+    }
+
     .stButton > button {
         border-radius: 8px;
         font-weight: 600;
