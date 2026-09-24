@@ -43,6 +43,59 @@ HISTORY_URL = f"{BACKEND_BASE_URL}/chat/history"
 STATS_URL = f"{BACKEND_BASE_URL}/habits/stats"
 
 st.set_page_config(page_title="Habit Tracker", page_icon="🏃")
+
+# Cosmetic only — no layout/behavior logic here. Streamlit's default chat/
+# sidebar chrome is functional but plain; this tightens spacing, rounds the
+# chat bubbles, and gives the sidebar/buttons/metrics a touch of color so the
+# app doesn't read as an unstyled prototype.
+st.markdown(
+    """
+    <style>
+    .block-container { padding-top: 2rem; max-width: 900px; }
+
+    h1 { font-weight: 700; letter-spacing: -0.02em; }
+
+    section[data-testid="stSidebar"] {
+        background-color: #f7f6f2;
+        border-right: 1px solid #e1e0d9;
+    }
+
+    [data-testid="stChatMessage"] {
+        border-radius: 14px;
+        padding: 0.75rem 1rem;
+        margin-bottom: 0.4rem;
+    }
+    [data-testid="stChatMessage"]:has(div[data-testid="chatAvatarIcon-user"]) {
+        background-color: #eaf1fb;
+    }
+    [data-testid="stChatMessage"]:has(div[data-testid="chatAvatarIcon-assistant"]) {
+        background-color: #f7f6f2;
+    }
+
+    [data-testid="stMetric"] {
+        background-color: #f7f6f2;
+        border: 1px solid #e1e0d9;
+        border-radius: 12px;
+        padding: 0.75rem 1rem 0.5rem;
+    }
+
+    .stButton > button {
+        border-radius: 8px;
+        font-weight: 600;
+    }
+
+    .stTabs [data-baseweb="tab"] {
+        font-weight: 600;
+    }
+
+    div[data-testid="stChatInput"] textarea {
+        border-radius: 10px;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 st.title("Habit Tracker")
 
 # Streamlit re-runs this whole script on every interaction, so session_state
