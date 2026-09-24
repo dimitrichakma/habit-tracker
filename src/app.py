@@ -42,6 +42,14 @@ TODAY_URL = f"{BACKEND_BASE_URL}/habits/today"
 HISTORY_URL = f"{BACKEND_BASE_URL}/chat/history"
 STATS_URL = f"{BACKEND_BASE_URL}/habits/stats"
 
+# Display-only cap on the Chat tab, separate from the backend's
+# MAX_HISTORY_TOKENS (agent.py's trim_history, which bounds what's sent to
+# the model). A months-old thread otherwise renders its entire history on
+# every script rerun, which gets slow and cluttered long before the model's
+# own context limit matters. Full history is untouched in session_state and
+# GET /chat/history — this only trims what's drawn on screen.
+MAX_DISPLAYED_MESSAGES = 40
+
 st.set_page_config(page_title="Habit Tracker", page_icon="🏃")
 
 # Cosmetic only — no layout/behavior logic here. Streamlit's default chat/
@@ -427,7 +435,10 @@ with st.sidebar:
 chat_tab, progress_tab = st.tabs(["💬 Chat", "📊 Progress"])
 
 with chat_tab:
-    for message in st.session_state.messages:
+    if len(st.session_state.messages) > MAX_DISPLAYED_MESSAGES:
+        st.caption(f"Showing the last {MAX_DISPLAYED_MESSAGES} messages of this conversation.")
+
+    for message in st.session_state.messages[-MAX_DISPLAYED_MESSAGES:]:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
