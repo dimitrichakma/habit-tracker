@@ -30,7 +30,14 @@ from apscheduler.triggers.cron import CronTrigger
 from langchain_core.callbacks import UsageMetadataCallbackHandler
 from telegram import Bot
 
-from .database import Habit, User, get_session, is_due_today, is_satisfied, record_token_usage
+from .database import (
+    find_user_id_by_username,
+    get_session,
+    get_user_habits,
+    is_due_today,
+    is_satisfied,
+    record_token_usage,
+)
 from .summarize_memory import summarize_user_week
 from .tools import describe_habit_pattern
 
@@ -67,17 +74,13 @@ def _environment() -> str:
 def _resolve_user_id(username: str) -> int:
     """Look up the target account once, at startup. Raises if it doesn't
     exist yet — sign up through the app first, then (re)start the backend."""
-    session = get_session()
-    try:
-        user = session.query(User).filter(User.username == username).first()
-        if user is None:
-            raise RuntimeError(
-                f"HABIT_TRACKER_USERNAME={username!r} matches no account. "
-                "Create it via the app, then restart the backend."
-            )
-        return user.id
-    finally:
-        session.close()
+    user_id = find_user_id_by_username(username)
+    if user_id is None:
+        raise RuntimeError(
+            f"HABIT_TRACKER_USERNAME={username!r} matches no account. "
+            "Create it via the app, then restart the backend."
+        )
+    return user_id
 
 
 def _friction_context(user_id: int, today: date) -> tuple[list[str], list[str]]:
@@ -93,7 +96,7 @@ def _friction_context(user_id: int, today: date) -> tuple[list[str], list[str]]:
     was the slowest turn the agent ran."""
     session = get_session()
     try:
-        habits = session.query(Habit).filter(Habit.user_id == user_id).all()
+        habits = get_user_habits(session, user_id)
         pending = [
             habit
             for habit in habits

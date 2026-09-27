@@ -33,7 +33,7 @@ import os
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 
-from .database import User, get_session
+from .database import find_user_id_by_username
 from .tools import get_pending_habits as _get_pending_habits
 from .tools import get_weekly_summary as _get_weekly_summary
 from .tools import list_habits as _list_habits
@@ -71,17 +71,13 @@ def _runtime() -> _FixedRuntime:
 def _resolve_user_id(username: str) -> int:
     """Look up the fixed account once, at startup. Raises if it doesn't
     exist — create it through the app first."""
-    session = get_session()
-    try:
-        user = session.query(User).filter(User.username == username).first()
-        if user is None:
-            raise RuntimeError(
-                f"HABIT_TRACKER_USERNAME={username!r} matches no account. "
-                "Create it via the app first, then start this server."
-            )
-        return user.id
-    finally:
-        session.close()
+    user_id = find_user_id_by_username(username)
+    if user_id is None:
+        raise RuntimeError(
+            f"HABIT_TRACKER_USERNAME={username!r} matches no account. "
+            "Create it via the app first, then start this server."
+        )
+    return user_id
 
 
 @mcp.tool()

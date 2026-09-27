@@ -22,7 +22,7 @@ from datetime import date, timedelta
 from langchain_anthropic import ChatAnthropic
 from langsmith import traceable
 
-from .database import Habit, User, get_session
+from .database import find_user_id_by_username, get_session, get_user_habits
 from .vector_store import get_habit_memory_store
 
 logger = logging.getLogger(__name__)
@@ -45,7 +45,11 @@ _SUMMARY_SYSTEM = (
 
 
 def _as_text(content: object) -> str:
-    """Normalize an AIMessage.content (str, or list of blocks) to plain text."""
+    """Normalize an AIMessage.content (str, or list of blocks) to plain text.
+    Same normalization as agent.extract_message_text — kept as a local copy
+    rather than imported, since agent.py builds its guardrail ChatAnthropic
+    clients at import time and this module has no other reason to pull in
+    that whole dependency chain for an 8-line helper."""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
@@ -63,7 +67,7 @@ def _collect_week(user_id: int, today: date) -> tuple[str, int]:
     window_start = today - timedelta(days=LOOKBACK_DAYS - 1)
     session = get_session()
     try:
-        habits = session.query(Habit).filter(Habit.user_id == user_id).all()
+        habits = get_user_habits(session, user_id)
         lines: list[str] = []
         row_count = 0
         for habit in habits:
@@ -147,15 +151,11 @@ def summarize_user_week(user_id: int, *, today: date | None = None) -> str | Non
 
 
 def _resolve_user_id(username: str) -> int:
-    """For the __main__ convenience path only — mirrors scheduler._resolve_user_id."""
-    session = get_session()
-    try:
-        user = session.query(User).filter(User.username == username).first()
-        if user is None:
-            raise RuntimeError(f"HABIT_TRACKER_USERNAME={username!r} matches no account.")
-        return user.id
-    finally:
-        session.close()
+    """For the __main__ convenience path only."""
+    user_id = find_user_id_by_username(username)
+    if user_id is None:
+        raise RuntimeError(f"HABIT_TRACKER_USERNAME={username!r} matches no account.")
+    return user_id
 
 
 def main() -> None:

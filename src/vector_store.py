@@ -28,6 +28,8 @@ from langchain_openai import OpenAIEmbeddings
 from langchain_postgres import PGVector
 from langsmith import traceable
 
+from .database import _normalize_pg_url
+
 COLLECTION_NAME = os.environ.get("HABIT_MEMORY_COLLECTION", "habit_summaries")
 EMBEDDING_MODEL = "text-embedding-3-small"
 
@@ -55,13 +57,9 @@ def _scrub_store_inputs(inputs: dict) -> dict:
 
 def _connection_url() -> str:
     """The Postgres URL for pgvector — same database as the relational tables.
-    Forces the psycopg (v3) driver, which is what's installed."""
-    url = os.environ["DATABASE_URL"]
-    if url.startswith("postgresql+"):
-        return url
-    if url.startswith("postgres://"):
-        url = url.replace("postgres://", "postgresql://", 1)
-    return url.replace("postgresql://", "postgresql+psycopg://", 1)
+    Forces the psycopg (v3) driver via database._normalize_pg_url, the same
+    normalization the relational engine applies to this same DATABASE_URL."""
+    return _normalize_pg_url(os.environ["DATABASE_URL"])
 
 
 _vector_store: PGVector | None = None

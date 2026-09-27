@@ -450,8 +450,9 @@
       user's chat thread (`str(user_id)`). The nudge needs no conversation
       memory, and keeping it off the chat thread stops the daily nudges
       inflating every later chat turn's re-sent history.
-      `tools._current_user_id` and `agent._acting_user_id` both parse the
-      user id out of that thread-id shape (first all-digit `-`-segment);
+      `tools._current_user_id` and `agent._acting_user_id` both resolve the
+      user id out of that thread-id shape via the shared
+      `tools.resolve_user_id_from_thread_id` (first all-digit `-`-segment);
       chat/Telegram/eval threads stay a bare numeric id.
     - `agent.input_guardrail` early-returns when the run is tagged
       `friction-check` — the trigger is server-authored, not user input, and

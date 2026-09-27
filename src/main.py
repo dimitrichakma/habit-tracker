@@ -27,7 +27,7 @@ from telegram import Update
 
 load_dotenv()
 
-from .agent import build_agent, postgres_checkpointer
+from .agent import build_agent, extract_message_text, postgres_checkpointer
 from .bot import build_application
 from .auth import (
     create_access_token,
@@ -38,11 +38,12 @@ from .auth import (
     verify_password,
 )
 from .database import (
-    Habit,
     User,
     backfill_orphaned_habits,
     daily_token_total,
+    find_user_id_by_username,
     get_session,
+    get_user_habits,
     init_db,
     is_due_today,
     is_satisfied,
@@ -281,6 +282,42 @@ def _budget_exceeded(user_id: int) -> bool:
         return False
 
 
+def _sum_usage(usage_cb: UsageMetadataCallbackHandler) -> tuple[int, int]:
+    """Sum (input_tokens, output_tokens) across every model a turn ran — the
+    worker AND the Haiku guardrail classifiers, all recorded on the same
+    UsageMetadataCallbackHandler. Shared by _invoke_agent and chat_stream's
+    post-stream usage recording."""
+    per_model = usage_cb.usage_metadata.values()
+    return (
+        sum(m.get("input_tokens", 0) or 0 for m in per_model),
+        sum(m.get("output_tokens", 0) or 0 for m in per_model),
+    )
+
+
+def _apply_gateway_checks(message: str, user_id: int) -> str:
+    """Shared entry checks for POST /chat and POST /chat/stream, in order:
+    size cap -> PII masking -> daily token budget (CLAUDE.md requires both
+    routes run identical checks in identical order — this is the one place
+    that's enforced rather than kept in sync by hand across two copies).
+    Returns the masked message, or raises the matching HTTPException."""
+    if len(message) > MAX_MESSAGE_CHARS:
+        raise HTTPException(
+            413,
+            f"Please keep your message under {MAX_MESSAGE_CHARS} characters — "
+            "send it in a couple of shorter messages.",
+        )
+    try:
+        message = mask_pii(message)
+    except Exception:
+        logger.warning("PII masking failed — blocking the request (fail-closed).", exc_info=True)
+        raise HTTPException(500, "Something went wrong on our end. Please try again.") from None
+
+    if _budget_exceeded(user_id):
+        raise HTTPException(429, "You've reached today's usage limit. Please try again tomorrow.")
+
+    return message
+
+
 async def _invoke_agent(message_text: str, config: dict) -> tuple[dict, tuple[int, int]]:
     """One agent turn with a hard timeout (AGENT_TIMEOUT_SECONDS). Returns
     `(result, (input_tokens, output_tokens))`.
@@ -307,12 +344,7 @@ async def _invoke_agent(message_text: str, config: dict) -> tuple[dict, tuple[in
         logger.warning("Agent invocation timed out after %.0fs.", AGENT_TIMEOUT_SECONDS)
         raise _AgentUnavailable from None
 
-    # usage_metadata is {model_name: {input_tokens, output_tokens, ...}} — sum
-    # across every model that ran this turn (worker + Haiku classifiers).
-    per_model = usage_cb.usage_metadata.values()
-    inp = sum(m.get("input_tokens", 0) or 0 for m in per_model)
-    out = sum(m.get("output_tokens", 0) or 0 for m in per_model)
-    return result, (inp, out)
+    return result, _sum_usage(usage_cb)
 
 
 async def _telegram_reply(message_text: str) -> str:
@@ -339,14 +371,9 @@ async def _telegram_reply(message_text: str) -> str:
         return "Sorry — I couldn't process that message. Please try rephrasing it."
 
     username = os.environ["HABIT_TRACKER_USERNAME"]
-    session = get_session()
-    try:
-        user = session.query(User).filter(User.username == username).first()
-        if user is None:
-            raise RuntimeError(f"No account for HABIT_TRACKER_USERNAME={username!r}")
-        user_id = user.id
-    finally:
-        session.close()
+    user_id = find_user_id_by_username(username)
+    if user_id is None:
+        raise RuntimeError(f"No account for HABIT_TRACKER_USERNAME={username!r}")
 
     if _budget_exceeded(user_id):
         return "You've hit today's usage limit for the coach — check back tomorrow."
@@ -376,7 +403,7 @@ async def _telegram_reply(message_text: str) -> str:
     else:  # no request context (shouldn't happen via the webhook) — record inline
         record_token_usage(user_id, date.today(), inp, out)
 
-    return _as_text(result["messages"][-1].content)
+    return extract_message_text(result["messages"][-1].content)
 
 
 @asynccontextmanager
@@ -601,7 +628,7 @@ async def habits_today(user_id: int = Depends(get_current_user_id)) -> TodayDash
     today = date.today()
     session = get_session()
     try:
-        habits = session.query(Habit).filter(Habit.user_id == user_id).all()
+        habits = get_user_habits(session, user_id)
         done, pending = [], []
         for habit in habits:
             if not is_due_today(habit, today):
@@ -665,7 +692,14 @@ async def habits_stats(days: int = 30, user_id: int = Depends(get_current_user_i
 
     session = get_session()
     try:
-        habits = session.query(Habit).filter(Habit.user_id == user_id).all()
+        habits = get_user_habits(session, user_id)
+
+        # One pass over each habit's logs to build its "done" date set, done
+        # once up front — the day loop below then does an O(1) lookup per
+        # habit instead of rescanning the full log list for every day.
+        done_dates_by_habit = {
+            habit.id: {log.date for log in habit.logs if log.status == "done"} for habit in habits
+        }
 
         trend = []
         for day in window:
@@ -673,10 +707,7 @@ async def habits_stats(days: int = 30, user_id: int = Depends(get_current_user_i
                 habit for habit in habits
                 if satisfaction_window_days(habit.frequency) == 1 and is_due_today(habit, day)
             ]
-            completed = sum(
-                1 for habit in due_habits
-                if any(log.date == day and log.status == "done" for log in habit.logs)
-            )
+            completed = sum(1 for habit in due_habits if day in done_dates_by_habit[habit.id])
             trend.append(DayCompletion(date=day.isoformat(), completed=completed, due=len(due_habits)))
 
         habit_histories = [
@@ -740,20 +771,7 @@ async def chat(
     Request` is required by the limiter.
     """
     correlation_id = _new_correlation_id("chat")
-    if len(payload.message) > MAX_MESSAGE_CHARS:
-        raise HTTPException(
-            413,
-            f"Please keep your message under {MAX_MESSAGE_CHARS} characters — "
-            "send it in a couple of shorter messages.",
-        )
-    try:
-        message = mask_pii(payload.message)
-    except Exception:
-        logger.warning("PII masking failed — blocking the request (fail-closed).", exc_info=True)
-        raise HTTPException(500, "Something went wrong on our end. Please try again.") from None
-
-    if _budget_exceeded(user_id):
-        raise HTTPException(429, "You've reached today's usage limit. Please try again tomorrow.")
+    message = _apply_gateway_checks(payload.message, user_id)
 
     logger.info("Chat request received (user_id=%s).", user_id)
     try:
@@ -778,24 +796,9 @@ async def chat(
 
     # .content is a plain string for a simple reply, but a list of blocks
     # (thinking + text) once extended thinking kicks in on a longer reply.
-    reply = _as_text(result["messages"][-1].content)
+    reply = extract_message_text(result["messages"][-1].content)
     logger.info("Chat request completed (user_id=%s, reply_chars=%d).", user_id, len(reply))
     return ChatResponse(reply=reply)
-
-
-def _as_text(content: object) -> str:
-    """Normalize a LangChain message's .content into plain text. It's a
-    plain string for a short reply, but a list of content blocks (e.g. a
-    thinking block + a text block) once Claude's extended thinking kicks
-    in — pull out just the text blocks and ignore the rest (like thinking,
-    which isn't meant for the end user to see)."""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        return "".join(
-            block.get("text", "") for block in content if isinstance(block, dict) and block.get("type") == "text"
-        )
-    return ""
 
 
 # --- Streaming chat (perceived-latency work) ----------------------------
@@ -852,7 +855,7 @@ async def _stream_agent(
                     model = (event.get("metadata") or {}).get("ls_model_name", "")
                     if "haiku" in model.lower():
                         continue  # the guardrail classifier, not the coach
-                    piece = _as_text(event["data"]["chunk"].content)
+                    piece = extract_message_text(event["data"]["chunk"].content)
                     if piece:
                         streamed = True
                         yield _sse({"type": "token", "text": piece})
@@ -862,7 +865,7 @@ async def _stream_agent(
                     if not messages:
                         break
                     last = messages[-1]
-                    final_text = _as_text(last.content)
+                    final_text = extract_message_text(last.content)
                     guardrail = (getattr(last, "response_metadata", None) or {}).get("guardrail")
                     if guardrail and guardrail.get("stage") == "output":
                         # output guardrail swapped the reply after it generated
@@ -895,20 +898,7 @@ async def chat_stream(
     gateway checks run before the stream opens; token usage is recorded once
     the stream finishes, via a response BackgroundTask."""
     correlation_id = _new_correlation_id("chat")
-    if len(payload.message) > MAX_MESSAGE_CHARS:
-        raise HTTPException(
-            413,
-            f"Please keep your message under {MAX_MESSAGE_CHARS} characters — "
-            "send it in a couple of shorter messages.",
-        )
-    try:
-        message = mask_pii(payload.message)
-    except Exception:
-        logger.warning("PII masking failed — blocking the request (fail-closed).", exc_info=True)
-        raise HTTPException(500, "Something went wrong on our end. Please try again.") from None
-
-    if _budget_exceeded(user_id):
-        raise HTTPException(429, "You've reached today's usage limit. Please try again tomorrow.")
+    message = _apply_gateway_checks(payload.message, user_id)
 
     usage_cb = UsageMetadataCallbackHandler()
     config = _agent_config(
@@ -924,9 +914,7 @@ async def chat_stream(
     )
 
     def _record_usage() -> None:
-        per_model = usage_cb.usage_metadata.values()
-        inp = sum(m.get("input_tokens", 0) or 0 for m in per_model)
-        out = sum(m.get("output_tokens", 0) or 0 for m in per_model)
+        inp, out = _sum_usage(usage_cb)
         if inp or out:
             record_token_usage(user_id, date.today(), inp, out)
 
@@ -994,7 +982,7 @@ async def chat_history(user_id: int = Depends(get_current_user_id)) -> ChatHisto
 
     history = []
     for message in raw_messages:
-        text = _as_text(message.content)
+        text = extract_message_text(message.content)
         if not text:
             continue  # skips tool-call-only messages (e.g. "call log_habit"), which have no user-facing text
         if isinstance(message, HumanMessage):

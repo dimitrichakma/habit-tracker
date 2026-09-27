@@ -11,7 +11,15 @@ from langchain.tools import ToolRuntime
 from langchain_core.tools import tool
 from langsmith import traceable
 
-from .database import Habit, HabitLog, get_session, is_due_today, is_satisfied, satisfaction_window_days
+from .database import (
+    Habit,
+    HabitLog,
+    get_session,
+    get_user_habits,
+    is_due_today,
+    is_satisfied,
+    satisfaction_window_days,
+)
 from .schedule_classifier import classify_frequency
 from .typesafe_client import get_typesafe_client
 from .vector_store import get_habit_memory_store
@@ -19,24 +27,27 @@ from .vector_store import get_habit_memory_store
 logger = logging.getLogger(__name__)
 
 
-def _current_user_id(runtime: ToolRuntime) -> int:
-    """The authenticated user's id, taken from the LangGraph thread_id that
-    main.py set from a verified JWT. NEVER accept a user/user_id argument
-    from the LLM itself for this purpose — an LLM-suppliable argument is
-    trivially spoofable via prompt injection ("pretend I'm user 1").
-
-    Chat / Telegram / eval threads are a bare numeric id. The scheduled
-    friction nudge runs on a throwaway thread `friction-<user_id>-<nonce>`
-    (so it doesn't drag the whole conversation history) — pull the id out
-    of that too, from a fixed position, never from anything the model said.
-    """
-    raw = str(runtime.config["configurable"]["thread_id"])
+def resolve_user_id_from_thread_id(raw: str) -> int:
+    """Pull a user id out of a LangGraph thread_id string. Chat / Telegram /
+    eval threads are a bare numeric id. The scheduled friction nudge runs on
+    a throwaway thread `friction-<user_id>-<nonce>` (so it doesn't drag the
+    whole conversation history) — pull the id out of that too, from a fixed
+    position. Shared by _current_user_id (tools.py) and agent._acting_user_id,
+    since both read the same thread_id shape from the same run config."""
     if raw.isdigit():
         return int(raw)
     for part in raw.split("-"):
         if part.isdigit():
             return int(part)
     raise ValueError(f"cannot resolve a user id from thread_id {raw!r}")
+
+
+def _current_user_id(runtime: ToolRuntime) -> int:
+    """The authenticated user's id, taken from the LangGraph thread_id that
+    main.py set from a verified JWT. NEVER accept a user/user_id argument
+    from the LLM itself for this purpose — an LLM-suppliable argument is
+    trivially spoofable via prompt injection ("pretend I'm user 1")."""
+    return resolve_user_id_from_thread_id(str(runtime.config["configurable"]["thread_id"]))
 
 
 def _resolve_log_date(log_date: str) -> date | None:
@@ -131,6 +142,13 @@ def _typesafe_resolve_habit(habit_name: str, habits: list[Habit]):
     return by_name.get(answer.choice)
 
 
+def _habit_by_exact_name(session, name: str, user_id: int) -> Habit | None:
+    """The one habit (scoped to user_id) whose name matches exactly, or None.
+    Shared by _find_habit's first lookup step, create_new_habit's
+    already-exists check, and delete_habit's exact-match-required lookup."""
+    return session.query(Habit).filter(Habit.name == name, Habit.user_id == user_id).first()
+
+
 def _find_habit(session, habit_name: str, user_id: int) -> Habit | list[Habit] | None:
     """Look up a habit (scoped to user_id) by exact name, then a TypeSafe
     meaning-based match (_typesafe_resolve_habit), then a case-insensitive
@@ -141,7 +159,7 @@ def _find_habit(session, habit_name: str, user_id: int) -> Habit | list[Habit] |
     Returns a single Habit on a clean match, a list of candidates when the
     fuzzy match is ambiguous (more than one), or None when nothing matches.
     """
-    exact = session.query(Habit).filter(Habit.name == habit_name, Habit.user_id == user_id).first()
+    exact = _habit_by_exact_name(session, habit_name, user_id)
     if exact is not None:
         return exact
 
@@ -149,7 +167,7 @@ def _find_habit(session, habit_name: str, user_id: int) -> Habit | list[Habit] |
     if not needle:
         return None
 
-    habits = session.query(Habit).filter(Habit.user_id == user_id).all()
+    habits = get_user_habits(session, user_id)
     if not habits:
         return None
 
@@ -170,6 +188,23 @@ def _find_habit(session, habit_name: str, user_id: int) -> Habit | list[Habit] |
     return None
 
 
+def _resolve_habit_or_error(
+    session, habit_name: str, user_id: int, *, not_found_suffix: str = ""
+) -> Habit | str:
+    """Resolve `habit_name` via `_find_habit` and turn its None/list/Habit
+    result into either the single Habit or a ready-to-return error string —
+    the "no match" / "ambiguous match" dispatch every `_find_habit` caller
+    needs before doing its own real work. `not_found_suffix` lets a caller
+    add its own follow-up (e.g. log_habit's "Create it first.")."""
+    habit = _find_habit(session, habit_name, user_id)
+    if habit is None:
+        return f"No habit named '{habit_name}' exists.{not_found_suffix}"
+    if isinstance(habit, list):
+        names = ", ".join(f"'{h.name}'" for h in habit)
+        return f"'{habit_name}' matches more than one habit: {names}. Ask the user which one they mean."
+    return habit
+
+
 @tool
 def create_new_habit(name: str, frequency: str, *, runtime: ToolRuntime) -> str:
     """Create a new habit for the user to track.
@@ -181,7 +216,7 @@ def create_new_habit(name: str, frequency: str, *, runtime: ToolRuntime) -> str:
     user_id = _current_user_id(runtime)
     session = get_session()
     try:
-        existing = session.query(Habit).filter(Habit.name == name, Habit.user_id == user_id).first()
+        existing = _habit_by_exact_name(session, name, user_id)
         if existing is not None:
             return f"A habit named '{name}' already exists."
 
@@ -207,7 +242,7 @@ def get_pending_habits(*, runtime: ToolRuntime) -> str:
     session = get_session()
     try:
         today = date.today()
-        habits = session.query(Habit).filter(Habit.user_id == user_id).all()
+        habits = get_user_habits(session, user_id)
         if not habits:
             return "No habits have been created yet."
 
@@ -245,12 +280,9 @@ def log_habit(habit_name: str, status: str, log_date: str = "today", *, runtime:
     user_id = _current_user_id(runtime)
     session = get_session()
     try:
-        habit = _find_habit(session, habit_name, user_id)
-        if habit is None:
-            return f"No habit named '{habit_name}' exists. Create it first."
-        if isinstance(habit, list):
-            names = ", ".join(f"'{h.name}'" for h in habit)
-            return f"'{habit_name}' matches more than one habit: {names}. Ask the user which one they mean."
+        habit = _resolve_habit_or_error(session, habit_name, user_id, not_found_suffix=" Create it first.")
+        if isinstance(habit, str):
+            return habit
 
         existing_log = session.query(HabitLog).filter(
             HabitLog.habit_id == habit.id, HabitLog.date == target_date
@@ -278,7 +310,7 @@ def list_habits(*, runtime: ToolRuntime) -> str:
     user_id = _current_user_id(runtime)
     session = get_session()
     try:
-        habits = session.query(Habit).filter(Habit.user_id == user_id).all()
+        habits = get_user_habits(session, user_id)
         if not habits:
             return "No habits have been created yet."
         lines = [f"- {habit.name} (id={habit.id}, frequency={habit.frequency})" for habit in habits]
@@ -302,7 +334,7 @@ def get_weekly_summary(*, runtime: ToolRuntime) -> str:
     user_id = _current_user_id(runtime)
     session = get_session()
     try:
-        habits = session.query(Habit).filter(Habit.user_id == user_id).all()
+        habits = get_user_habits(session, user_id)
         if not habits:
             return "No habits have been created yet."
 
@@ -426,15 +458,9 @@ def get_habit_history_pattern(habit_name: str, *, runtime: ToolRuntime) -> str:
     user_id = _current_user_id(runtime)
     session = get_session()
     try:
-        habit = _find_habit(session, habit_name, user_id)
-        if habit is None:
-            return f"No habit named '{habit_name}' exists."
-        if isinstance(habit, list):
-            names = ", ".join(f"'{h.name}'" for h in habit)
-            return (
-                f"'{habit_name}' matches more than one habit: {names}. "
-                "Ask the user which one they mean."
-            )
+        habit = _resolve_habit_or_error(session, habit_name, user_id)
+        if isinstance(habit, str):
+            return habit
         return describe_habit_pattern(habit, date.today())
     finally:
         session.close()
@@ -486,7 +512,7 @@ def delete_habit(habit_name: str, *, runtime: ToolRuntime) -> str:
     user_id = _current_user_id(runtime)
     session = get_session()
     try:
-        habit = session.query(Habit).filter(Habit.name == habit_name, Habit.user_id == user_id).first()
+        habit = _habit_by_exact_name(session, habit_name, user_id)
         if habit is None:
             return f"No habit named '{habit_name}' exists."
         session.delete(habit)

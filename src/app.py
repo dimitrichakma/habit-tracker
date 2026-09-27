@@ -147,14 +147,22 @@ def auth_headers() -> dict:
     return {"Authorization": f"Bearer {st.session_state.token}"}
 
 
-def authed_request(method: str, url: str, **kwargs):
-    """Wraps requests.request with the auth header; drops back to the login
-    screen on a 401 (expired/invalid token) instead of showing a raw error."""
-    response = requests.request(method, url, headers=auth_headers(), **kwargs)
+def _drop_to_login_on_401(response: requests.Response) -> None:
+    """Shared by authed_request and stream_reply: on an expired/invalid
+    token, clear the session and rerun so the login screen shows instead of
+    a raw error. st.rerun() never returns, so callers don't need an early
+    return after calling this."""
     if response.status_code == 401:
         st.session_state.clear()
         st.warning("Session expired — please log in again.")
         st.rerun()
+
+
+def authed_request(method: str, url: str, **kwargs):
+    """Wraps requests.request with the auth header; drops back to the login
+    screen on a 401 (expired/invalid token) instead of showing a raw error."""
+    response = requests.request(method, url, headers=auth_headers(), **kwargs)
+    _drop_to_login_on_401(response)
     response.raise_for_status()
     return response
 
@@ -176,10 +184,7 @@ def stream_reply(prompt: str) -> str:
             stream=True,
             timeout=(10, 120),
         )
-        if response.status_code == 401:
-            st.session_state.clear()
-            st.warning("Session expired — please log in again.")
-            st.rerun()
+        _drop_to_login_on_401(response)
         if response.status_code != 200:
             try:
                 detail = response.json().get("detail", "the backend rejected the request")

@@ -93,7 +93,14 @@ class Habit(Base):
     schedule_type: Mapped[str | None] = mapped_column(String, nullable=True)
     excluded_weekday: Mapped[str | None] = mapped_column(String, nullable=True)
 
-    logs: Mapped[list["HabitLog"]] = relationship(back_populates="habit", cascade="all, delete-orphan")
+    # lazy="selectin": every caller that fetches a user's habits then reads
+    # .logs (dashboard, stats, get_pending_habits, weekly summary, friction
+    # nudge) would otherwise trigger one extra SELECT per habit (SQLAlchemy's
+    # default lazy="select"). selectin loads all habits' logs in one extra
+    # query total, regardless of how many habits there are.
+    logs: Mapped[list["HabitLog"]] = relationship(
+        back_populates="habit", cascade="all, delete-orphan", lazy="selectin"
+    )
 
 
 class HabitLog(Base):
@@ -200,6 +207,29 @@ def get_session() -> Session:
     return SessionLocal()
 
 
+def get_user_habits(session: Session, user_id: int) -> list[Habit]:
+    """Every habit belonging to user_id, unfiltered by due/status. Shared by
+    every caller that needs "all of this user's habits" — tools.py's several
+    tools, main.py's dashboard/stats routes, scheduler's friction context,
+    summarize_memory's weekly digest, agent.py's guardrail habit-name list —
+    instead of each restating the same query."""
+    return session.query(Habit).filter(Habit.user_id == user_id).all()
+
+
+def find_user_id_by_username(username: str) -> int | None:
+    """`User.id` for `username`, or None if no such account exists. Shared by
+    every in-process caller that resolves a fixed HABIT_TRACKER_USERNAME to
+    an internal id once at startup (scheduler.py, summarize_memory.py's
+    __main__, mcp_server.py) — each raises its own contextually-worded error
+    when the account doesn't exist yet, so this only owns the lookup."""
+    session = get_session()
+    try:
+        user = session.query(User).filter(User.username == username).first()
+        return user.id if user else None
+    finally:
+        session.close()
+
+
 # --- Token budget (Phase 6.3) -----------------------------------------
 # A coarse daily spend guardrail on the Anthropic worker model. Only the
 # worker agent's usage_metadata is tracked here — the fast Haiku guardrail
@@ -251,7 +281,7 @@ def record_token_usage(user_id: int, day: date, input_tokens: int, output_tokens
     except IntegrityError:
         # A concurrent insert beat us to the (user_id, usage_date) row — near
         # impossible in this single-user app, but the unique constraint keeps it
-        # correct. Retry as a pure increment.
+        # correct. Retry as a pure increment (the row now exists).
         session.rollback()
         row = (
             session.query(TokenUsage)

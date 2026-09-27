@@ -27,7 +27,7 @@ from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 from pydantic import BaseModel, ConfigDict, Field
 
-from .tools import TOOLS
+from .tools import TOOLS, resolve_user_id_from_thread_id
 
 logger = logging.getLogger(__name__)
 
@@ -346,8 +346,13 @@ _output_classifier = ChatAnthropic(
 ).with_structured_output(OutputGuardrailClassification)
 
 
-def _message_text(content: object) -> str:
-    """A message's text — plain string, or the text blocks of a block list."""
+def extract_message_text(content: object) -> str:
+    """A message's text — plain string, or the text blocks of a block list.
+    Shared with main.py, which already imports this module for build_agent.
+    scheduler.py and summarize_memory.py keep their own copies (_reply_text,
+    _as_text) rather than importing this one — not because the logic
+    differs, but because it would pull in this module's ChatAnthropic
+    guardrail clients (built at import time) for an 8-line helper."""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
@@ -361,14 +366,9 @@ def _message_text(content: object) -> str:
 
 def _acting_user_id() -> int | None:
     """The user id for the turn being classified, from the run config's
-    thread_id (same source every tool uses). None if it can't be resolved.
-    Handles the scheduled nudge's throwaway `friction-<user_id>-<nonce>`
-    thread the same way tools._current_user_id does."""
+    thread_id (same source every tool uses). None if it can't be resolved."""
     try:
-        raw = str(get_config()["configurable"]["thread_id"])
-        if raw.isdigit():
-            return int(raw)
-        return next(int(part) for part in raw.split("-") if part.isdigit())
+        return resolve_user_id_from_thread_id(str(get_config()["configurable"]["thread_id"]))
     except Exception:
         return None
 
@@ -378,11 +378,11 @@ def _known_habit_names(user_id: int) -> list[str]:
     like 'the skill lesson isn't finished yet' is read as a habit update, not
     off-topic. Best-effort; [] on any failure (the classifier still works)."""
     try:
-        from .database import Habit, get_session
+        from .database import get_session, get_user_habits
 
         session = get_session()
         try:
-            return [h.name for h in session.query(Habit).filter(Habit.user_id == user_id).all()]
+            return [h.name for h in get_user_habits(session, user_id)]
         finally:
             session.close()
     except Exception:  # pragma: no cover - defensive
@@ -395,7 +395,7 @@ def _classifier_context(messages: list, keep: int = 4) -> str:
     fragmentary reply ('not yet', 'still going') is classified in context."""
     lines: list[str] = []
     for message in messages[-(keep + 1) : -1]:
-        text = _message_text(message.content).strip()
+        text = extract_message_text(message.content).strip()
         if not text:
             continue
         if isinstance(message, HumanMessage):
@@ -502,7 +502,7 @@ async def input_guardrail(state, runtime) -> dict | None:
     # Only a brand-new user message — not the model call that follows a tool result.
     if not isinstance(last, HumanMessage):
         return None
-    text = _message_text(last.content).strip()
+    text = extract_message_text(last.content).strip()
     if not text:
         return None
 
@@ -569,7 +569,7 @@ async def output_guardrail(state, runtime) -> dict | None:
         return None  # only a final, user-facing reply
     if (last.response_metadata or {}).get("guardrail"):
         return None  # already produced by a guardrail (e.g. an input refusal)
-    text = _message_text(last.content).strip()
+    text = extract_message_text(last.content).strip()
     if not text:
         return None
 
