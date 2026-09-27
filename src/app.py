@@ -56,69 +56,77 @@ st.set_page_config(page_title="Habit Tracker", page_icon="🏃")
 # sidebar chrome is functional but plain; this tightens spacing, rounds the
 # chat bubbles, and gives the sidebar/buttons/metrics a touch of color so the
 # app doesn't read as an unstyled prototype.
+#
+# Selectors key off Streamlit's internal data-testid attributes (stSidebar,
+# stChatMessage, stMetric, ...) — undocumented DOM internals, not a public
+# API. A Streamlit version bump could rename/drop one and the matching rule
+# would just stop applying (degrades to unstyled, doesn't error).
+#
+# Colors are CSS custom properties so each one is stated once and overridden
+# once for dark mode, rather than repeated per selector. --card-border reuses
+# COLOR_NEUTRAL (already defined above for the Plotly charts) so the two
+# palettes don't silently drift apart.
 st.markdown(
-    """
+    f"""
     <style>
-    .block-container { padding-top: 2rem; max-width: 900px; }
-
-    h1 { font-weight: 700; letter-spacing: -0.02em; }
-
-    section[data-testid="stSidebar"] {
-        background-color: #f7f6f2;
-        border-right: 1px solid #e1e0d9;
-    }
-
-    [data-testid="stChatMessage"] {
-        border-radius: 14px;
-        padding: 0.75rem 1rem;
-        margin-bottom: 0.4rem;
-    }
-    [data-testid="stChatMessage"]:has(div[data-testid="chatAvatarIcon-user"]) {
-        background-color: #eaf1fb;
-    }
-    [data-testid="stChatMessage"]:has(div[data-testid="chatAvatarIcon-assistant"]) {
-        background-color: #f7f6f2;
-    }
-
-    [data-testid="stMetric"] {
-        background-color: #f7f6f2;
-        border: 1px solid #e1e0d9;
-        border-radius: 12px;
-        padding: 0.75rem 1rem 0.5rem;
-    }
-
+    :root {{
+        --sidebar-bg: #f7f6f2;
+        --card-bg: #f7f6f2;
+        --card-border: {COLOR_NEUTRAL};
+        --bubble-user-bg: #eaf1fb;
+    }}
     /* Streamlit's dark theme (browser/OS prefers-color-scheme) makes the
        light-mode colors above unreadable — the sidebar background and chat
        bubbles need dark-appropriate counterparts, not just "no color". */
-    @media (prefers-color-scheme: dark) {
-        section[data-testid="stSidebar"] {
-            background-color: #1c1f26;
-            border-right: 1px solid #333844;
-        }
-        [data-testid="stChatMessage"]:has(div[data-testid="chatAvatarIcon-user"]) {
-            background-color: #1d2f47;
-        }
-        [data-testid="stChatMessage"]:has(div[data-testid="chatAvatarIcon-assistant"]) {
-            background-color: #23262e;
-        }
-        [data-testid="stMetric"] {
-            background-color: #23262e;
-            border: 1px solid #333844;
-        }
-    }
+    @media (prefers-color-scheme: dark) {{
+        :root {{
+            --sidebar-bg: #1c1f26;
+            --card-bg: #23262e;
+            --card-border: #333844;
+            --bubble-user-bg: #1d2f47;
+        }}
+    }}
 
-    .stButton > button {
+    .block-container {{ padding-top: 2rem; max-width: 900px; }}
+
+    h1 {{ font-weight: 700; letter-spacing: -0.02em; }}
+
+    section[data-testid="stSidebar"] {{
+        background-color: var(--sidebar-bg);
+        border-right: 1px solid var(--card-border);
+    }}
+
+    [data-testid="stChatMessage"] {{
+        border-radius: 14px;
+        padding: 0.75rem 1rem;
+        margin-bottom: 0.4rem;
+    }}
+    [data-testid="stChatMessage"]:has(div[data-testid="chatAvatarIcon-user"]) {{
+        background-color: var(--bubble-user-bg);
+    }}
+    [data-testid="stChatMessage"]:has(div[data-testid="chatAvatarIcon-assistant"]) {{
+        background-color: var(--card-bg);
+    }}
+
+    [data-testid="stMetric"] {{
+        background-color: var(--card-bg);
+        border: 1px solid var(--card-border);
+        border-radius: 12px;
+        padding: 0.75rem 1rem 0.5rem;
+    }}
+
+    .stButton > button {{
         border-radius: 8px;
         font-weight: 600;
-    }
+    }}
 
-    .stTabs [data-baseweb="tab"] {
+    .stTabs [data-baseweb="tab"] {{
         font-weight: 600;
-    }
+    }}
 
-    div[data-testid="stChatInput"] textarea {
+    div[data-testid="stChatInput"] textarea {{
         border-radius: 10px;
-    }
+    }}
     </style>
     """,
     unsafe_allow_html=True,
@@ -435,10 +443,11 @@ with st.sidebar:
 chat_tab, progress_tab = st.tabs(["💬 Chat", "📊 Progress"])
 
 with chat_tab:
-    if len(st.session_state.messages) > MAX_DISPLAYED_MESSAGES:
+    visible_messages = st.session_state.messages[-MAX_DISPLAYED_MESSAGES:]
+    if len(visible_messages) < len(st.session_state.messages):
         st.caption(f"Showing the last {MAX_DISPLAYED_MESSAGES} messages of this conversation.")
 
-    for message in st.session_state.messages[-MAX_DISPLAYED_MESSAGES:]:
+    for message in visible_messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
