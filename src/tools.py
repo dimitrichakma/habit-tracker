@@ -5,7 +5,8 @@ SQLite via SQLAlchemy — no data is ever guessed by the agent.
 """
 
 import logging
-from datetime import date, timedelta
+import re
+from datetime import date, datetime, timedelta
 
 from langchain.tools import ToolRuntime
 from langchain_core.tools import tool
@@ -60,6 +61,41 @@ def _resolve_log_date(log_date: str) -> date | None:
         return date.fromisoformat(log_date)
     except ValueError:
         return None
+
+
+# A habit name containing one of these reads as a night/bedtime activity.
+# Plain keyword match — Phase 7's TypeSafe judgment is reserved for the two
+# call sites CLAUDE.md already lists, not widened to a third here.
+_NIGHT_HABIT_PATTERN = re.compile(r"\b(bedtime|sleep|night|evening|pm|wind[- ]down)\b", re.IGNORECASE)
+
+# Before this hour, logging a night-sounding habit for *today* (not
+# "yesterday") is very likely the exact mix-up log_habit's own docstring
+# already tells callers to avoid via log_date="yesterday". Naive local time —
+# matches the same clock the agent's own "current time" prompt block uses
+# (agent.habit_coach_prompt's datetime.now()), so the two never disagree
+# about what "morning" means.
+_MORNING_CUTOFF_HOUR = 11
+
+
+def _morning_mismatch_warning(habit_name: str, target_date: date, status: str) -> str:
+    """A trailing warning for log_habit's reply when a night-sounding habit
+    was just logged 'done' for today before the local morning cutoff — the
+    "logged it the next morning but meant last night" mistake. Returns ""
+    when no warning applies, so callers can always do
+    `reply + _morning_mismatch_warning(...)`."""
+    if status != "done" or target_date != date.today():
+        return ""
+    if not _NIGHT_HABIT_PATTERN.search(habit_name):
+        return ""
+    now = datetime.now()
+    if now.hour >= _MORNING_CUTOFF_HOUR:
+        return ""
+    return (
+        f" Heads up: '{habit_name}' sounds like a night habit, and it's only "
+        f"{now.strftime('%I:%M %p').lstrip('0')} — if you meant last night, log it "
+        'with log_date="yesterday" instead. If this was logged by mistake, say so '
+        "and I can remove it with undo_habit_log."
+    )
 
 
 _WEEKDAY_LABELS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
@@ -294,7 +330,8 @@ def log_habit(habit_name: str, status: str, log_date: str = "today", *, runtime:
             session.add(HabitLog(habit_id=habit.id, date=target_date, status=status))
 
         session.commit()
-        return f"Logged '{habit.name}' as '{status}' for {target_date.isoformat()}."
+        reply = f"Logged '{habit.name}' as '{status}' for {target_date.isoformat()}."
+        return reply + _morning_mismatch_warning(habit.name, target_date, status)
     finally:
         session.close()
 
@@ -522,6 +559,45 @@ def delete_habit(habit_name: str, *, runtime: ToolRuntime) -> str:
         session.close()
 
 
+@tool
+def undo_habit_log(habit_name: str, log_date: str = "today", *, runtime: ToolRuntime) -> str:
+    """Remove one day's logged entry for a habit — use when the user says a
+    log was a mistake (e.g. a night habit logged too early, the wrong status,
+    or a duplicate). Deletes just that day's log row; the habit itself and
+    its other history are untouched. Unlike delete_habit (which permanently
+    removes the whole habit and every log it has), this only undoes one entry
+    and the habit can be logged again normally afterward.
+
+    Args:
+        habit_name: The exact name of the habit whose log to remove
+            (fuzzy-matched like log_habit).
+        log_date: Which day's log to remove: "today" (default), "yesterday",
+            or an explicit "YYYY-MM-DD" date.
+    """
+    target_date = _resolve_log_date(log_date)
+    if target_date is None:
+        return f"'{log_date}' isn't a date I understand. Use 'today', 'yesterday', or YYYY-MM-DD."
+
+    user_id = _current_user_id(runtime)
+    session = get_session()
+    try:
+        habit = _resolve_habit_or_error(session, habit_name, user_id)
+        if isinstance(habit, str):
+            return habit
+
+        log = session.query(HabitLog).filter(
+            HabitLog.habit_id == habit.id, HabitLog.date == target_date
+        ).first()
+        if log is None:
+            return f"No log found for '{habit.name}' on {target_date.isoformat()}."
+
+        session.delete(log)
+        session.commit()
+        return f"Removed the log for '{habit.name}' on {target_date.isoformat()}."
+    finally:
+        session.close()
+
+
 TOOLS = [
     create_new_habit,
     get_pending_habits,
@@ -531,4 +607,5 @@ TOOLS = [
     get_habit_history_pattern,
     query_past_behavior,
     delete_habit,
+    undo_habit_log,
 ]

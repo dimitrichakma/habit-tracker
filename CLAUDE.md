@@ -79,6 +79,12 @@
   `create_new_habit` time, never on the `is_due_today`/`is_satisfied` hot
   path). Both fail soft to their pre-Phase-7 behavior if TypeSafe is
   unconfigured or errors — see Rules.
+- Phase 8 (complete): mistake-recovery for logging. `log_habit` warns
+  (without blocking) when a night-sounding habit is logged `"done"` for
+  today before the local morning cutoff — the "logged it the next morning
+  but meant last night" mix-up — and a new `undo_habit_log` tool removes
+  one day's log entry without touching the habit or its other history. See
+  `tools.py`'s entry below.
 
 # Tech Stack
 - Backend: FastAPI, LangGraph, LangChain (Anthropic), SQLAlchemy,
@@ -169,6 +175,25 @@
     `schedule_classifier.classify_frequency(frequency)` once and stores
     its result (or NULLs on a soft failure) on the new `Habit` columns —
     see `database.py`'s Habit entry above.
+  - **Phase 8: morning-mismatch warning + undo.** `log_habit` appends a
+    trailing warning (via `_morning_mismatch_warning`) when a night-sounding
+    habit (`_NIGHT_HABIT_PATTERN` — plain keyword regex: bedtime/sleep/
+    night/evening/pm/wind-down, never a TypeSafe call — see the Phase 7
+    carve-out below) is logged `"done"` for *today* before
+    `_MORNING_CUTOFF_HOUR` (11) — the exact "logged it the next morning but
+    meant last night" case the tool's own docstring already tells callers
+    to handle via `log_date="yesterday"` instead. Uses naive
+    `datetime.now()`, matching `agent.habit_coach_prompt`'s own "current
+    time" signal so the two never disagree about what "morning" means. The
+    log is always saved regardless of the warning — never blocked. New
+    `undo_habit_log(habit_name, log_date="today")` tool removes just that
+    one day's `HabitLog` row (fuzzy-matched like `log_habit`, via
+    `_resolve_habit_or_error`) — unlike `delete_habit`, the habit and its
+    other history are untouched. `agent.py`'s system prompt tells the coach
+    to relay the warning verbatim and only call `undo_habit_log` on the
+    user's explicit confirmation, never on its own judgment. Not exposed
+    via `mcp_server.py`, same caution as `delete_habit` (no confirm-first
+    safety net for an external MCP client).
   - `get_habit_history_pattern(habit_name)` — **Phase 3**. Plain-text
     pattern summary from `HabitLog` history (e.g. "missed 4 of last 5
     Mondays"), pure SQL, no schema change. The tool is a thin wrapper
