@@ -38,9 +38,11 @@ from .auth import (
     verify_password,
 )
 from .database import (
+    Habit,
     User,
     backfill_orphaned_habits,
     daily_token_total,
+    delete_habit_log,
     find_user_id_by_username,
     get_session,
     get_user_habits,
@@ -49,6 +51,7 @@ from .database import (
     is_satisfied,
     record_token_usage,
     satisfaction_window_days,
+    upsert_habit_log,
 )
 from .scheduler import run_friction_nudge, start_reminder_scheduler
 
@@ -471,6 +474,7 @@ LOGIN_RATE_LIMIT = os.environ.get("LOGIN_RATE_LIMIT", "5/minute")  # by IP (brut
 SIGNUP_RATE_LIMIT = os.environ.get("SIGNUP_RATE_LIMIT", "3/minute")  # by IP
 CHAT_RATE_LIMIT = os.environ.get("CHAT_RATE_LIMIT", "20/minute")  # by authed user_id (6.3)
 FRICTION_RATE_LIMIT = os.environ.get("FRICTION_RATE_LIMIT", "10/minute")  # by IP
+HABIT_LOG_RATE_LIMIT = os.environ.get("HABIT_LOG_RATE_LIMIT", "60/minute")  # by authed user_id
 
 limiter = Limiter(key_func=get_remote_address, swallow_errors=True)
 
@@ -643,6 +647,61 @@ async def habits_today(user_id: int = Depends(get_current_user_id)) -> TodayDash
             )
             (done if is_satisfied(habit, today) else pending).append(item)
         return TodayDashboard(date=today.isoformat(), done=done, pending=pending)
+    finally:
+        session.close()
+
+
+class HabitLogRequest(BaseModel):
+    done: bool
+    # JSON key is "date"; the Python name differs so it can't shadow the type.
+    log_date: date | None = Field(default=None, alias="date")  # defaults to today
+
+
+class HabitLogResponse(BaseModel):
+    habit_id: int
+    name: str
+    date: str
+    status: str | None
+
+
+@app.post("/habits/{habit_id}/log", response_model=HabitLogResponse)
+@limiter.limit(HABIT_LOG_RATE_LIMIT, key_func=_user_id_rate_key)
+async def log_habit_direct(
+    request: Request,
+    habit_id: int,
+    payload: HabitLogRequest,
+    user_id: int = Depends(_rate_limit_user_id),
+) -> HabitLogResponse:
+    """Mark one habit done / not done for a day without going through the
+    agent — for a desktop client ticking checkboxes. Writes through the same
+    database.upsert_habit_log / delete_habit_log the chat tools use, so the
+    two paths can never disagree or duplicate a day's log. "Not done" removes
+    the log (like undo_habit_log) rather than writing "missed", so an
+    un-ticked mistake doesn't count as a real miss in pattern detection.
+    Habit is addressed by id (from GET /habits/today), never by fuzzy name."""
+    day = payload.log_date or date.today()
+    if day > date.today():
+        raise HTTPException(422, "Can't log a habit for a future date.")
+
+    session = get_session()
+    try:
+        habit = session.get(Habit, habit_id)
+        # Same 404 for "no such habit" and "someone else's habit" — a distinct
+        # answer would let a caller probe which habit ids exist.
+        if habit is None or habit.user_id != user_id:
+            raise HTTPException(404, "Habit not found.")
+
+        if payload.done:
+            upsert_habit_log(session, habit.id, day, "done")
+        else:
+            delete_habit_log(session, habit.id, day)
+        session.commit()
+        return HabitLogResponse(
+            habit_id=habit.id,
+            name=habit.name,
+            date=day.isoformat(),
+            status="done" if payload.done else None,
+        )
     finally:
         session.close()
 

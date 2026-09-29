@@ -14,12 +14,13 @@ from langsmith import traceable
 
 from .database import (
     Habit,
-    HabitLog,
+    delete_habit_log,
     get_session,
     get_user_habits,
     is_due_today,
     is_satisfied,
     satisfaction_window_days,
+    upsert_habit_log,
 )
 from .schedule_classifier import classify_frequency
 from .typesafe_client import get_typesafe_client
@@ -320,15 +321,7 @@ def log_habit(habit_name: str, status: str, log_date: str = "today", *, runtime:
         if isinstance(habit, str):
             return habit
 
-        existing_log = session.query(HabitLog).filter(
-            HabitLog.habit_id == habit.id, HabitLog.date == target_date
-        ).first()
-
-        if existing_log is not None:
-            existing_log.status = status
-        else:
-            session.add(HabitLog(habit_id=habit.id, date=target_date, status=status))
-
+        upsert_habit_log(session, habit.id, target_date, status)
         session.commit()
         reply = f"Logged '{habit.name}' as '{status}' for {target_date.isoformat()}."
         return reply + _morning_mismatch_warning(habit.name, target_date, status)
@@ -585,13 +578,9 @@ def undo_habit_log(habit_name: str, log_date: str = "today", *, runtime: ToolRun
         if isinstance(habit, str):
             return habit
 
-        log = session.query(HabitLog).filter(
-            HabitLog.habit_id == habit.id, HabitLog.date == target_date
-        ).first()
-        if log is None:
+        if not delete_habit_log(session, habit.id, target_date):
             return f"No log found for '{habit.name}' on {target_date.isoformat()}."
 
-        session.delete(log)
         session.commit()
         return f"Removed the log for '{habit.name}' on {target_date.isoformat()}."
     finally:

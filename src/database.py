@@ -216,6 +216,32 @@ def get_user_habits(session: Session, user_id: int) -> list[Habit]:
     return session.query(Habit).filter(Habit.user_id == user_id).all()
 
 
+def upsert_habit_log(session: Session, habit_id: int, day: date, status: str) -> HabitLog:
+    """Set this habit's status for `day` — update the existing row if there is
+    one, otherwise insert it — so a habit never has two logs for one day.
+    Shared by tools.log_habit (chat / Telegram) and main.py's
+    POST /habits/{id}/log, so both write paths behave identically. The caller
+    owns ownership checks, commit, and close."""
+    log = session.query(HabitLog).filter(HabitLog.habit_id == habit_id, HabitLog.date == day).first()
+    if log is not None:
+        log.status = status
+    else:
+        log = HabitLog(habit_id=habit_id, date=day, status=status)
+        session.add(log)
+    return log
+
+
+def delete_habit_log(session: Session, habit_id: int, day: date) -> bool:
+    """Remove this habit's log for `day`. Returns False when there was none.
+    Shared by tools.undo_habit_log and main.py's POST /habits/{id}/log
+    (done=false). The caller owns ownership checks, commit, and close."""
+    log = session.query(HabitLog).filter(HabitLog.habit_id == habit_id, HabitLog.date == day).first()
+    if log is None:
+        return False
+    session.delete(log)
+    return True
+
+
 def find_user_id_by_username(username: str) -> int | None:
     """`User.id` for `username`, or None if no such account exists. Shared by
     every in-process caller that resolves a fixed HABIT_TRACKER_USERNAME to

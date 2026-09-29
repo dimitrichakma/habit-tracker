@@ -25,8 +25,11 @@ from datetime import date
 
 # Rate-limit thresholds are frozen into the ``@limiter.limit(...)`` decorators
 # at import time, so pin small, predictable limits BEFORE importing ``src.main``.
-# This module is the only importer of ``src.main`` in the suite (and sorts
-# first alphabetically), so these assignments always win.
+# This module sorts first alphabetically among the suite's ``src.main``
+# importers (test_habit_log_endpoints.py also imports it, but depends on no
+# limit values), so these assignments win under a plain ``pytest evaluation/``.
+# Listing test_habit_log_endpoints.py BEFORE this file on the command line
+# would import ``src.main`` with the default limits and break these tests.
 os.environ["CHAT_RATE_LIMIT"] = "3/minute"
 os.environ["LOGIN_RATE_LIMIT"] = "3/minute"
 os.environ["SIGNUP_RATE_LIMIT"] = "3/minute"

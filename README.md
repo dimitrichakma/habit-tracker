@@ -20,6 +20,11 @@ without ever guessing at data it hasn't actually looked up.
 
 - **Conversational logging.** "Did my run and skipped the gym" logs both in
   one turn, fuzzy-matching each name against your existing habits.
+- **Direct logging API (no LLM).** `POST /habits/{id}/log` with
+  `{"done": true|false, "date"?: "YYYY-MM-DD"}` ticks a habit on or off for a
+  day, for a desktop or other non-chat client. It shares the chat tools'
+  write functions, so the two paths never duplicate or disagree. Pair it with
+  `GET /habits/today`, and use the same JWT from `/auth/login`.
 - **Today's Dashboard and Progress charts** - a plain data view (no LLM call)
   for the deterministic "what's done today" question, plus historical trend
   and streak charts.
@@ -302,6 +307,7 @@ cloudflared tunnel --url http://localhost:8000
 uv run pytest evaluation/test_rag_agent.py        # LLM-as-a-Judge coaching eval (~3-4 min, real API calls)
 uv run pytest evaluation/test_guardrails.py       # safety guardrails, drives the real agent
 uv run pytest evaluation/test_gateway_security.py # rate limits / size cap / PII / budget / timeout (offline, fast)
+uv run pytest evaluation/test_habit_log_endpoints.py # direct POST /habits/{id}/log API (offline, fast)
 uv run pytest tests/                              # real pgvector integration (Docker or TEST_DATABASE_URL)
 ```
 

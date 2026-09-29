@@ -85,6 +85,10 @@
   but meant last night" mix-up — and a new `undo_habit_log` tool removes
   one day's log entry without touching the habit or its other history. See
   `tools.py`'s entry below.
+- Quick-logging API (complete): `POST /habits/{habit_id}/log` — a direct,
+  no-LLM done/not-done toggle for a desktop client, alongside the existing
+  `GET /habits/today`. Writes through the same `database.upsert_habit_log` /
+  `delete_habit_log` the chat tools use. See `main.py`'s entry below.
 
 # Tech Stack
 - Backend: FastAPI, LangGraph, LangChain (Anthropic), SQLAlchemy,
@@ -155,6 +159,14 @@
     nullable-column migration `_migrate_add_habits_user_id()` is
     **SQLite-only** (guarded on `engine.dialect.name`; `PRAGMA` isn't
     valid Postgres). `backfill_orphaned_habits()` unchanged.
+  - `upsert_habit_log(session, habit_id, day, status)` /
+    `delete_habit_log(session, habit_id, day) -> bool` — the ONLY code that
+    writes/removes a `HabitLog` row. Update-or-insert, so one habit never
+    gets two logs for the same day. Shared by `tools.log_habit` /
+    `undo_habit_log` and `main.py`'s `POST /habits/{id}/log`; the caller owns
+    ownership checks, commit, and close. Never re-inline the query. (No DB
+    unique constraint on `(habit_id, date)` — a truly concurrent double
+    insert is theoretically possible; accepted for single-user scope.)
   - `is_due_today()` / `is_satisfied()` — single source of truth for
     frequency logic (rolling 7-day "weekly", skip "except <Weekday>",
     `status=="done"`-only). Used everywhere pending/satisfied status is
@@ -365,6 +377,18 @@
     (Telegram path + eval suites); only `src/app.py` uses `/chat/stream`.
   - `GET /habits/today`, `GET /habits/stats?days=N`, `GET /chat/history`
     — all auth-required, scoped to caller's `user_id`.
+  - `POST /habits/{habit_id}/log` — direct quick-logging for a desktop
+    client, no agent/LLM. Body `{"done": bool, "date"?: "YYYY-MM-DD"}`
+    (Pydantic field `log_date`, alias `date` — a field named `date` shadows
+    the type). JWT via `Depends(_rate_limit_user_id)`, user-keyed
+    `HABIT_LOG_RATE_LIMIT` (60/minute). Habit addressed by **id** (from
+    `GET /habits/today`), never fuzzy name — no TypeSafe call. Missing OR
+    another user's habit → the same 404 (no id probing). Future date → 422.
+    `done=true` → `upsert_habit_log(..., "done")`; `done=false` →
+    `delete_habit_log` (removes the log, like `undo_habit_log` — never writes
+    `"missed"`, so an un-ticked mistake doesn't pollute pattern detection);
+    both idempotent. Outside the gateway on purpose (no free text, no LLM →
+    no size cap / masking / budget). Returns `{habit_id, name, date, status}`.
   - `POST /evaluate_friction` — **Phase 3**. Manual trigger for testing,
     same auth pattern as `/chat`: identity from
     `Depends(get_current_user_id)` only, never a client-supplied
@@ -401,7 +425,7 @@
     `limiter = Limiter(key_func=get_remote_address,
     swallow_errors=True)` (fail-open); `@limiter.limit` on the four
     routes with env-configurable limits (`LOGIN_/SIGNUP_/CHAT_/
-    FRICTION_RATE_LIMIT`); `@app.exception_handler(Exception)` →
+    FRICTION_/HABIT_LOG_RATE_LIMIT`); `@app.exception_handler(Exception)` →
     generic 500, real error logged server-side.
   - **Correlation ids** (Phase 6.1): `_new_correlation_id(prefix)` opens
     a `ContextVar` scope per request / Telegram update; a logging filter
@@ -592,6 +616,12 @@
     failure fails safe; a monkeypatched `_output_classifier` verdict
     swaps the reply for `_OUTPUT_FALLBACK`. Same isolation as
     `test_rag_agent.py` (unique thread_id, throwaway SQLite).
+  - `evaluation/test_habit_log_endpoints.py` — offline `TestClient` suite
+    for `POST /habits/{id}/log` + the shared `upsert_habit_log` /
+    `delete_habit_log` (no-duplicate upsert, done/undone, dates, auth, 404
+    ownership, `GET /habits/today` agreement, chat tool + HTTP sharing one
+    row). Also imports `src.main`, so it must sort AFTER
+    `test_gateway_security.py` (which pins rate-limit env before import).
   - `evaluation/test_gateway_security.py` — **Phase 6**. Drives
     `src/main.py`'s HTTP layer via `TestClient` (lifespan NOT run —
     `app.state` gets a `_FakeAgent` / fake Telegram app; throwaway
@@ -729,6 +759,10 @@
 - Run the gateway/security suite: `uv run pytest evaluation/test_gateway_security.py`
   — fully offline (fake agent), fast, no API keys needed beyond what
   importing `src` requires.
+- Run the quick-logging API suite: `uv run pytest evaluation/test_habit_log_endpoints.py`
+  — fully offline, fast. When running it together with
+  `test_gateway_security.py`, list the gateway file first (or just run
+  `pytest evaluation/`) — see that suite's import-order note.
 - Run the pgvector integration test: `uv run pytest tests/` — needs Docker
   (spins up a `pgvector/pgvector` container) OR `TEST_DATABASE_URL` set to
   a scratch DB, plus `OPENAI_API_KEY`. Skips cleanly if neither is
@@ -760,7 +794,7 @@
   - **Phase 6**, all optional (sane defaults; full docs in `.env.example`):
     `LANGSMITH_TRACING` / `LANGSMITH_API_KEY` / `LANGSMITH_PROJECT`
     (`habit-tracker`) — tracing off if unset. `SIGNUP_SECRET` — gates
-    `/auth/signup` (open if unset). `LOGIN_/SIGNUP_/CHAT_/FRICTION_RATE_LIMIT`
+    `/auth/signup` (open if unset). `LOGIN_/SIGNUP_/CHAT_/FRICTION_/HABIT_LOG_RATE_LIMIT`
     (slowapi strings), `TELEGRAM_RATE_LIMIT_PER_MIN` (int). `MAX_MESSAGE_CHARS`
     (1000), `MAX_DAILY_QUOTA` (default 200000 tokens/user/day — **raised to
     1000000 on Railway** after a months-old thread hit the default in ~3
