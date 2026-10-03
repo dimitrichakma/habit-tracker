@@ -40,7 +40,9 @@ without ever guessing at data it hasn't actually looked up.
   instead of guessing.
 - **Telegram bot** with a daily reminder and an evening "friction check" that
   proactively messages you if habits are still pending, using the same
-  pattern-aware logic as the chat.
+  pattern-aware logic as the chat. `/today` shows today's habits as tap-to-log
+  buttons (✅ done / ⬜ not) that toggle in place with no typing and no LLM
+  call, locked to the linked Telegram user.
 - **Per-user accounts** with JWT authentication - each user's habits, chat
   history, and Telegram reminders are fully isolated.
 - **A standalone MCP server**, separate from the production agent, exposing
@@ -308,6 +310,7 @@ uv run pytest evaluation/test_rag_agent.py        # LLM-as-a-Judge coaching eval
 uv run pytest evaluation/test_guardrails.py       # safety guardrails, drives the real agent
 uv run pytest evaluation/test_gateway_security.py # rate limits / size cap / PII / budget / timeout (offline, fast)
 uv run pytest evaluation/test_habit_log_endpoints.py # direct POST /habits/{id}/log API (offline, fast)
+uv run pytest evaluation/test_telegram_buttons.py # Telegram /today tap-to-log buttons (offline, fast; list after the gateway file)
 uv run pytest tests/                              # real pgvector integration (Docker or TEST_DATABASE_URL)
 ```
 
@@ -350,4 +353,4 @@ Feature-complete through Phase 8.
 - **Phase 6** — LangSmith tracing + correlation ids, security layer (signup gate that fails *closed* on a deployment, rate limiting, headers), latency work (worker thinking capped to `medium`, 1-hour prompt-cache TTL, history-trimming middleware), a real non-mocked pgvector integration test, AI guardrails (input/output safety classification, context-aware with an asymmetric block policy), and an infrastructure gateway (size cap, PII masking, token budget covering the guardrail classifiers too, timeout, generic errors) ✅
   - Post-launch fixes from production traces: three messages on a months-old thread blew the 200k daily token cap → history trimming + a higher quota + thread cleanup; the off-topic classifier blocked a real habit update → habit-name/recent-turn context + soft-blocking below `OFF_TOPIC_BLOCK_CONFIDENCE`; `bot.py` stopped echoing raw exception text to Telegram; `deepeval` / `pytest` moved to the dev dependency group so `uv sync --no-dev` drops them from the Railway image; the web chat now streams (SSE) with a per-tool status line instead of a blocking spinner; the evening friction nudge — the agent's heaviest turn — was cut from 3–5 worker calls to 1 by pre-computing each habit's history pattern in Python and running it on a throwaway thread.
 - **Phase 7** — replaced two fragile parsing spots with a bounded TypeSafe (System One) judgment call: `tools._find_habit` now resolves a loosely-phrased habit name by meaning (falling back to the old substring match if TypeSafe is unset or unsure), and `create_new_habit` structures the frequency phrase once at creation time into `Habit.schedule_type`/`excluded_weekday`, so `is_due_today`/`is_satisfied` stay pure deterministic reads. Both fail soft to pre-Phase-7 behavior; TypeSafe never generates or judges agent-facing text — that stays Claude-only ✅
-- **Phase 8** — mistake recovery for logging: `log_habit` now warns (without blocking) when a night-sounding habit gets logged "done" for today before the morning — the classic "logged it the next morning but meant last night" mix-up — and points at the existing `log_date="yesterday"` option. A new `undo_habit_log` tool removes just that one day's log entry (the habit and its other history stay untouched), which the coach only calls on the user's explicit confirmation ✅
+- **Phase 8** — mistake recovery for logging: `log_habit` now warns (without blocking) when a night-sounding habit gets logged "done" for today before the morning — the classic "logged it the next morning but meant last night" mix-up — and points at the existing `log_date="yesterday"` option. A new `undo_habit_log` tool removes just that one day's log entry (the habit and its other history stay untouched), which the coach only calls on the user's explicit confirmation ✅- **Quick logging** — a direct, no-LLM `POST /habits/{id}/log` for a desktop client, plus Telegram `/today` tap-to-log buttons: an inline keyboard (✅ done / ⬜ not, ☑️ when a weekly habit was done earlier in the window) whose taps toggle a habit and edit the same message in place. Both write through one shared `database.set_habit_done`, the bot calls it in-process (no HTTP to itself), and every tap re-checks the Telegram user against `TELEGRAM_CHAT_ID` (fails closed if unset) ✅

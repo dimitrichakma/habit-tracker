@@ -242,6 +242,23 @@ def delete_habit_log(session: Session, habit_id: int, day: date) -> bool:
     return True
 
 
+def set_habit_done(session: Session, user_id: int, habit_id: int, day: date, done: bool) -> Habit | None:
+    """Mark one habit done / not done for `day`, addressed by id. Returns the
+    habit, or None when it doesn't exist OR belongs to another user — one
+    answer for both, so a caller can't probe which ids exist. Shared by
+    main.py's POST /habits/{id}/log and the Telegram tap-to-log buttons.
+    "Not done" removes the log (never writes "missed"). The caller owns
+    commit and close."""
+    habit = session.get(Habit, habit_id)
+    if habit is None or habit.user_id != user_id:
+        return None
+    if done:
+        upsert_habit_log(session, habit.id, day, "done")
+    else:
+        delete_habit_log(session, habit.id, day)
+    return habit
+
+
 def find_user_id_by_username(username: str) -> int | None:
     """`User.id` for `username`, or None if no such account exists. Shared by
     every in-process caller that resolves a fixed HABIT_TRACKER_USERNAME to

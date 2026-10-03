@@ -28,7 +28,7 @@ from telegram import Update
 load_dotenv()
 
 from .agent import build_agent, extract_message_text, postgres_checkpointer
-from .bot import build_application
+from .bot import TodayItem, TodayView, build_application
 from .auth import (
     create_access_token,
     get_current_user_id,
@@ -42,7 +42,6 @@ from .database import (
     User,
     backfill_orphaned_habits,
     daily_token_total,
-    delete_habit_log,
     find_user_id_by_username,
     get_session,
     get_user_habits,
@@ -51,7 +50,7 @@ from .database import (
     is_satisfied,
     record_token_usage,
     satisfaction_window_days,
-    upsert_habit_log,
+    set_habit_done,
 )
 from .scheduler import run_friction_nudge, start_reminder_scheduler
 
@@ -434,7 +433,11 @@ async def lifespan(app: FastAPI):
 
         # Telegram: build the Application, drive it in-process. Updates arrive
         # at POST /webhook/telegram, which calls telegram_app.process_update().
-        telegram_app = build_application(on_message=_telegram_reply)
+        telegram_app = build_application(
+            on_message=_telegram_reply,
+            on_today=_telegram_today_view,
+            on_toggle=_telegram_toggle,
+        )
         app.state.telegram_app = telegram_app
         await telegram_app.initialize()
         await telegram_app.start()
@@ -443,7 +446,11 @@ async def lifespan(app: FastAPI):
         secret_token = os.environ.get("WEBHOOK_SECRET_TOKEN")
         if webhook_url:
             try:
-                await telegram_app.bot.set_webhook(url=webhook_url, secret_token=secret_token)
+                await telegram_app.bot.set_webhook(
+                    url=webhook_url,
+                    secret_token=secret_token,
+                    allowed_updates=["message", "callback_query"],
+                )
                 logger.info("Telegram webhook registered at %s", webhook_url)
             except Exception:
                 # The real public URL often isn't known until after the first
@@ -685,16 +692,11 @@ async def log_habit_direct(
 
     session = get_session()
     try:
-        habit = session.get(Habit, habit_id)
+        habit = set_habit_done(session, user_id, habit_id, day, payload.done)
         # Same 404 for "no such habit" and "someone else's habit" — a distinct
         # answer would let a caller probe which habit ids exist.
-        if habit is None or habit.user_id != user_id:
+        if habit is None:
             raise HTTPException(404, "Habit not found.")
-
-        if payload.done:
-            upsert_habit_log(session, habit.id, day, "done")
-        else:
-            delete_habit_log(session, habit.id, day)
         session.commit()
         return HabitLogResponse(
             habit_id=habit.id,
@@ -702,6 +704,68 @@ async def log_habit_direct(
             date=day.isoformat(),
             status="done" if payload.done else None,
         )
+    finally:
+        session.close()
+
+
+# --- Telegram tap-to-log (/today buttons) -----------------------------------
+# bot.py does the Telegram I/O; these two callbacks (handed to
+# build_application) do the data side, in-process — no HTTP to our own API.
+# Identity is the fixed HABIT_TRACKER_USERNAME account, resolved server-side.
+
+
+def _telegram_user_id() -> int:
+    username = os.environ["HABIT_TRACKER_USERNAME"]
+    user_id = find_user_id_by_username(username)
+    if user_id is None:
+        raise RuntimeError(f"No account for HABIT_TRACKER_USERNAME={username!r}")
+    return user_id
+
+
+def _today_view(session, user_id: int, today: date) -> TodayView:
+    """Same habits as GET /habits/today (due today only). `state` is what a tap
+    will do: "done" = today's own log is done (tap removes it); "earlier" =
+    satisfied only by an earlier day in the rolling window (tap logs today);
+    "pending" = not satisfied (tap logs today)."""
+    items: list[TodayItem] = []
+    for habit in get_user_habits(session, user_id):
+        if not is_due_today(habit, today):
+            continue
+        if any(entry.date == today and entry.status == "done" for entry in habit.logs):
+            items.append(TodayItem(habit.id, habit.name, "done", None))
+        elif is_satisfied(habit, today):
+            last_done = max(entry.date for entry in habit.logs if entry.status == "done" and entry.date <= today)
+            items.append(TodayItem(habit.id, habit.name, "earlier", last_done.strftime("%a")))
+        else:
+            items.append(TodayItem(habit.id, habit.name, "pending", None))
+    return TodayView(label=today.strftime("%a %b %d"), items=items)
+
+
+async def _telegram_today_view() -> TodayView:
+    today = date.today()
+    session = get_session()
+    try:
+        return _today_view(session, _telegram_user_id(), today)
+    finally:
+        session.close()
+
+
+async def _telegram_toggle(habit_id: int) -> TodayView | None:
+    """Toggle one habit's log for today, then return the freshly rendered view
+    (None if the habit doesn't exist or isn't this user's)."""
+    today = date.today()
+    session = get_session()
+    try:
+        user_id = _telegram_user_id()
+        habit = session.get(Habit, habit_id)
+        if habit is None or habit.user_id != user_id:
+            return None
+        done_today = any(entry.date == today and entry.status == "done" for entry in habit.logs)
+        if set_habit_done(session, user_id, habit_id, today, not done_today) is None:
+            return None
+        session.commit()
+        session.expire_all()  # re-read logs so the view reflects the write
+        return _today_view(session, user_id, today)
     finally:
         session.close()
 

@@ -89,6 +89,11 @@
   no-LLM done/not-done toggle for a desktop client, alongside the existing
   `GET /habits/today`. Writes through the same `database.upsert_habit_log` /
   `delete_habit_log` the chat tools use. See `main.py`'s entry below.
+- Telegram tap-to-log (complete): `/today` in the existing bot shows today's due
+  habits as inline-keyboard buttons; a tap toggles that habit and edits the same
+  message. No LLM, no HTTP to our own API — `bot.py` gets two callbacks from
+  `main.py`, which call `database.set_habit_done` in-process (the same function
+  `POST /habits/{id}/log` uses). Chat logging is unchanged.
 
 # Tech Stack
 - Backend: FastAPI, LangGraph, LangChain (Anthropic), SQLAlchemy,
@@ -167,6 +172,11 @@
     ownership checks, commit, and close. Never re-inline the query. (No DB
     unique constraint on `(habit_id, date)` — a truly concurrent double
     insert is theoretically possible; accepted for single-user scope.)
+  - `set_habit_done(session, user_id, habit_id, day, done) -> Habit | None` —
+    the one id-addressed logging function: ownership check (missing OR another
+    user's → `None`, no id probing) + `upsert_habit_log` / `delete_habit_log`.
+    Used by `POST /habits/{id}/log` and the Telegram tap handler. Caller
+    commits/closes.
   - `is_due_today()` / `is_satisfied()` — single source of truth for
     frequency logic (rolling 7-day "weekly", skip "except <Weekday>",
     `status=="done"`-only). Used everywhere pending/satisfied status is
@@ -408,6 +418,15 @@
     reply (so Telegram doesn't retry). Otherwise stashes chat_id /
     message_id / correlation_id / `background_tasks` on
     `_telegram_update_ctx` and calls `telegram_app.process_update(update)`.
+  - **Telegram tap-to-log callbacks:** `_telegram_today_view()` /
+    `_telegram_toggle(habit_id)` (passed to `bot.build_application` as
+    `on_today` / `on_toggle`; user = `HABIT_TRACKER_USERNAME`). View = the
+    habits `GET /habits/today` shows, each with a `state`: `done` (today's own
+    log is done — tap removes it), `earlier` (weekly habit satisfied by an
+    earlier day in the window — tap logs today), `pending`. A tap only ever
+    toggles *today's* log, never an earlier day's. `set_webhook` passes
+    `allowed_updates=["message","callback_query"]`; the webhook needs no change
+    for callback queries (`effective_chat` is set, `message` is `None`).
   - `GET /healthz` — **Phase 5**. `{"status": "ok"}`, no DB/agent touch.
   - `_telegram_reply(text)` — the callback handed to `build_application`.
     Size cap → `mask_pii` → resolve `HABIT_TRACKER_USERNAME` → `user_id`
@@ -464,6 +483,17 @@
   `except` block replies with a **generic** message and logs the real
   exception server-side — never echoes `exc` (it can carry a DB error
   string or the `HABIT_TRACKER_USERNAME` `RuntimeError`).
+  - **Tap-to-log (`/today`):** `build_application(on_message, on_today=None,
+    on_toggle=None)` — the two optional callbacks register a `/today`
+    `CommandHandler` and a `CallbackQueryHandler` (`^tog:\d+$`). Still no DB
+    imports: `TodayItem` / `TodayView` are plain NamedTuples defined here and
+    produced by `main.py`. Labels: `✅ Name` / `☑️ Name (done Mon)` /
+    `⬜ Name`; the tap edits the same message (`BadRequest: message is not
+    modified` swallowed). `_is_linked_user` checks `effective_user.id ==
+    TELEGRAM_CHAT_ID` on `/today` and on **every tap** — callback queries
+    bypass the message `filters.Chat`, and unlike plain chat this **fails
+    CLOSED** when `TELEGRAM_CHAT_ID` is unset (these handlers write data).
+    Unauthorized / unknown-habit taps get an alert, no write, no edit.
 - `src/scheduler.py` — **Phase 2/3/4**, unchanged in Phase 5. Runs
   in-process with FastAPI
   (trusted context — may import `database.py` directly, unlike `bot.py`).
@@ -622,6 +652,13 @@
     ownership, `GET /habits/today` agreement, chat tool + HTTP sharing one
     row). Also imports `src.main`, so it must sort AFTER
     `test_gateway_security.py` (which pins rate-limit env before import).
+  - `evaluation/test_telegram_buttons.py` — offline suite for `/today` + taps:
+    drives `bot.py`'s handlers with fake `Update`/`CallbackQuery` objects
+    against `main.py`'s real callbacks and a throwaway SQLite (rendering,
+    toggle, weekly ☑️ cycle, wrong user / unset `TELEGRAM_CHAT_ID` / forged
+    habit id refused, `set_habit_done`, handler wiring, callback-query
+    webhook). Imports `src.main`, so it must sort AFTER
+    `test_gateway_security.py` (list it after the gateway file).
   - `evaluation/test_gateway_security.py` — **Phase 6**. Drives
     `src/main.py`'s HTTP layer via `TestClient` (lifespan NOT run —
     `app.state` gets a `_FakeAgent` / fake Telegram app; throwaway
@@ -763,6 +800,8 @@
   — fully offline, fast. When running it together with
   `test_gateway_security.py`, list the gateway file first (or just run
   `pytest evaluation/`) — see that suite's import-order note.
+- Run the Telegram tap-to-log suite: `uv run pytest evaluation/test_telegram_buttons.py`
+  — fully offline, fast; same import-order note as the quick-logging suite.
 - Run the pgvector integration test: `uv run pytest tests/` — needs Docker
   (spins up a `pgvector/pgvector` container) OR `TEST_DATABASE_URL` set to
   a scratch DB, plus `OPENAI_API_KEY`. Skips cleanly if neither is
@@ -814,6 +853,10 @@
     meaning-based habit match and `classify_frequency`'s schedule
     structuring. Unset or invalid → both fail soft to pre-Phase-7
     behavior (see Rules); never required for the app to run.
+- **Telegram tap-to-log needs `TELEGRAM_CHAT_ID`** — `/today` and every button
+  tap check the sender against it and refuse everything if it's unset. Keep
+  the check on every tap (callback queries skip the message chat filter), and
+  keep logging going through `database.set_habit_done` — never re-inline it.
 - **Checkpointer uses Neon's DIRECT endpoint; everything else uses the
   POOLED endpoint.** `postgres_checkpointer()` runs server-side prepared
   statements (`prepare_threshold=0`) that PgBouncer transaction pooling
