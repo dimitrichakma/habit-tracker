@@ -39,17 +39,17 @@ if DATABASE_URL.startswith("sqlite"):
     # via get_session() rather than sharing one connection across requests.
     engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 else:
-    # pool_recycle: proactively discard a pooled connection older than this
-    # before reuse, so most of Neon's idle-suspend drops are avoided without a
-    # network hop. pool_pre_ping: the safety net for the rest — one extra
-    # round trip per checkout, but it means a dead connection is never handed
-    # to a request (matters for the daily Telegram path; the round trip is
-    # ~10ms once the backend and Neon are co-located). prepare_threshold=None:
+    # pool_recycle: discard a pooled connection older than this before reuse.
+    # It sits under Neon's ~5 min idle-suspend, so a connection that sat idle
+    # long enough to be dropped is always recycled at checkout — which is why
+    # pool_pre_ping is OFF: it cost one extra round trip (est. ~50ms) on
+    # every checkout, i.e. on every Telegram tap. Residual risk: a connection
+    # dropped by Neon sooner than 280s of age fails that one request; turn
+    # pre_ping back on if that ever shows up in the logs. prepare_threshold=None:
     # disable psycopg3 prepared statements so the same URL works through Neon's
     # pooled (PgBouncer / "-pooler") endpoint as well as the direct one.
     engine = create_engine(
         _normalize_pg_url(DATABASE_URL),
-        pool_pre_ping=True,
         pool_recycle=280,
         connect_args={"prepare_threshold": None},
     )

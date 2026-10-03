@@ -59,8 +59,8 @@
     isolation against a real Postgres+pgvector (testcontainers or
     `TEST_DATABASE_URL`).
   - **Latency:** Anthropic prompt caching on the static system-prompt
-    block, `pool_recycle` on the DB engine, Railway region co-located
-    with Neon (`us-east-2`). `SummarizationMiddleware` was tried and
+    block, `pool_recycle` on the DB engine (`pool_pre_ping` off — it cost an est. ~50ms per checkout, i.e. per Telegram tap), Railway region `us-east4`
+    (Virginia — the closest Railway has to Neon's `us-east-2`, Ohio). `SummarizationMiddleware` was tried and
     **removed** — it fired twice per turn (+20-30s).
   - **AI guardrails & semantic safety:** input classification (regex
     pre-filter → Claude Haiku classifier) short-circuiting the agent on
@@ -143,7 +143,7 @@
   - Engine reads `DATABASE_URL`; falls back to `sqlite:///habits.db` when
     unset (local dev, and the eval suite, which swaps in its own throwaway
     SQLite). `_normalize_pg_url()` forces the `postgresql+psycopg://`
-    driver; Postgres engine uses `pool_pre_ping=True` +
+    driver; Postgres engine uses `pool_recycle=280` (no pre-ping) +
     `connect_args={"prepare_threshold": None}` so the SAME url works on
     Neon's POOLED (PgBouncer / `-pooler`) endpoint.
   - `User(id, username, hashed_password)`; `Habit(id, user_id FK, name,
