@@ -22,7 +22,8 @@ from __future__ import annotations
 import logging
 import os
 import uuid
-from datetime import date
+from collections.abc import Awaitable, Callable
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -30,6 +31,7 @@ from apscheduler.triggers.cron import CronTrigger
 from langchain_core.callbacks import UsageMetadataCallbackHandler
 from telegram import Bot
 
+from .bot import TodayView, render_today
 from .database import (
     find_user_id_by_username,
     get_session,
@@ -53,10 +55,89 @@ SUMMARY_DAY_OF_WEEK = "sun"
 SUMMARY_HOUR = 23
 SUMMARY_MINUTE = 59
 
+# Evening "unlogged habits" prompt with tap buttons (no LLM).
+EVENING_JOB_ID = "evening_unlogged_prompt"
+EVENING_DEFAULT_TIME = (21, 30)
+
 # Pin both jobs to a fixed zone rather than the server's local time, so they
 # still fire on Dhaka wall-clock after deploying to a UTC cloud host. Override
 # with the REMINDER_TIMEZONE env var if the account ever moves zones.
 REMINDER_TIMEZONE = ZoneInfo(os.environ.get("REMINDER_TIMEZONE", "Asia/Dhaka"))
+
+
+def evening_prompt_config() -> tuple[bool, int, int]:
+    """`(enabled, hour, minute)` from EVENING_PROMPT_ENABLED / EVENING_PROMPT_TIME.
+    Defaults: on, 21:30. A malformed time warns and falls back to the default."""
+    enabled = os.environ.get("EVENING_PROMPT_ENABLED", "true").strip().lower() not in (
+        "false", "0", "off", "no",
+    )
+    raw = os.environ.get("EVENING_PROMPT_TIME", "").strip()
+    hour, minute = EVENING_DEFAULT_TIME
+    if raw:
+        try:
+            h, m = raw.split(":")
+            h, m = int(h), int(m)
+            if not (0 <= h <= 23 and 0 <= m <= 59):
+                raise ValueError(raw)
+            hour, minute = h, m
+        except ValueError:
+            logger.warning(
+                "Bad EVENING_PROMPT_TIME=%r (want HH:MM) — using %02d:%02d.", raw, hour, minute
+            )
+    return enabled, hour, minute
+
+
+class EveningPromptState:
+    """Remembers the last day the evening prompt went out (once-per-day guard)."""
+
+    def __init__(self) -> None:
+        self.last_sent: date | None = None
+
+
+def _now_local() -> datetime:
+    return datetime.now(REMINDER_TIMEZONE)
+
+
+async def run_evening_prompt(
+    build_view: Callable[[date], Awaitable[TodayView]],
+    send: Callable[[TodayView], Awaitable[None]],
+    *,
+    now: Callable[[], datetime] = _now_local,
+    state: EveningPromptState,
+) -> bool:
+    """Send today's still-unlogged habits (state "pending" only) once per day.
+    Returns True if a message went out. `now` is injectable for tests. The day
+    is marked sent only after `send` succeeds, so a failed send can retry."""
+    day = now().date()
+    if state.last_sent == day:
+        return False
+    view = await build_view(day)
+    pending = [item for item in view.items if item.state == "pending"]
+    if not pending:
+        return False
+    await send(TodayView(label=view.label, items=pending))
+    state.last_sent = day
+    return True
+
+
+async def _send_evening_prompt(
+    build_view: Callable[[date], Awaitable[TodayView]],
+    bot_token: str,
+    chat_id: str,
+    state: EveningPromptState,
+) -> None:
+    async def send(view: TodayView) -> None:
+        text, markup = render_today(view)
+        async with Bot(token=bot_token) as bot:
+            await bot.send_message(chat_id=chat_id, text=text, reply_markup=markup)
+
+    try:
+        if await run_evening_prompt(build_view, send, state=state):
+            logger.info("Sent evening unlogged-habits prompt.")
+        else:
+            logger.info("Evening prompt: nothing to send.")
+    except Exception:
+        logger.exception("Evening prompt job failed.")
 
 
 def _environment() -> str:
@@ -250,7 +331,9 @@ def _run_weekly_summary(user_id: int) -> None:
         logger.exception("Weekly behavioral-summary job failed.")
 
 
-def start_reminder_scheduler(agent) -> AsyncIOScheduler:
+def start_reminder_scheduler(
+    agent, evening_view: Callable[[date], Awaitable[TodayView]] | None = None
+) -> AsyncIOScheduler:
     """Build, start, and return the scheduler. The caller (main.py's
     lifespan) owns the returned object and must call .shutdown() on teardown.
 
@@ -294,6 +377,19 @@ def start_reminder_scheduler(agent) -> AsyncIOScheduler:
         replace_existing=True,
         misfire_grace_time=3600,
     )
+    enabled, ev_hour, ev_minute = evening_prompt_config()
+    if enabled and evening_view is not None:
+        scheduler.add_job(
+            _send_evening_prompt,
+            trigger=CronTrigger(hour=ev_hour, minute=ev_minute, timezone=REMINDER_TIMEZONE),
+            args=(evening_view, bot_token, chat_id, EveningPromptState()),
+            id=EVENING_JOB_ID,
+            replace_existing=True,
+            misfire_grace_time=3600,
+        )
+        logger.info("Evening prompt scheduled at %02d:%02d.", ev_hour, ev_minute)
+    else:
+        logger.info("Evening prompt disabled.")
     scheduler.start()
     logger.info(
         "Scheduler started for user_id=%d — daily nudge at %02d:%02d %s, "

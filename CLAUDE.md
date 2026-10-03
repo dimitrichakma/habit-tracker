@@ -89,6 +89,14 @@
   no-LLM done/not-done toggle for a desktop client, alongside the existing
   `GET /habits/today`. Writes through the same `database.upsert_habit_log` /
   `delete_habit_log` the chat tools use. See `main.py`'s entry below.
+- Evening unlogged-habits prompt (complete): a third job on the same scheduler
+  (`evening_unlogged_prompt`, default 21:30 `REMINDER_TIMEZONE`) sends the
+  `/today` tap buttons for still-`pending` habits only — once per day
+  (`EveningPromptState`), skipped if nothing is unlogged, no LLM. Env:
+  `EVENING_PROMPT_ENABLED` (default on), `EVENING_PROMPT_TIME` (`HH:MM`).
+  `scheduler.run_evening_prompt` takes an injectable `now` (fake-clock tests in
+  `evaluation/test_evening_prompt.py`); `main._telegram_evening_view` feeds it;
+  `bot.render_today` is the shared renderer. Taps reuse the existing handlers.
 - Telegram tap-to-log (complete): `/today` in the existing bot shows today's due
   habits as inline-keyboard buttons; a tap toggles that habit and edits the same
   message. No LLM, no HTTP to our own API — `bot.py` gets two callbacks from

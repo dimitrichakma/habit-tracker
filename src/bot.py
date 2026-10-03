@@ -104,7 +104,7 @@ def _is_linked_user(update: Update) -> bool:
     return bool(allowed) and user is not None and user.id == int(allowed)
 
 
-def _render_today(view: TodayView) -> tuple[str, InlineKeyboardMarkup | None]:
+def render_today(view: TodayView) -> tuple[str, InlineKeyboardMarkup | None]:
     if not view.items:
         return f"Today ({view.label}): no habits due.", None
     rows = []
@@ -124,7 +124,7 @@ async def _handle_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
     on_today: OnToday = context.application.bot_data["on_today"]
     try:
-        text, markup = _render_today(await on_today())
+        text, markup = render_today(await on_today())
     except Exception:
         logger.exception("Failed to build the /today view.")
         await update.message.reply_text("⚠️ Something went wrong on my end. Please try again in a moment.")
@@ -150,7 +150,7 @@ async def _handle_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await query.answer("Habit not found.", show_alert=True)
         return
     await query.answer()
-    text, markup = _render_today(view)
+    text, markup = render_today(view)
     try:
         await query.edit_message_text(text, reply_markup=markup)
     except BadRequest as exc:

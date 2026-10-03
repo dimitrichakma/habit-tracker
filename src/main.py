@@ -429,7 +429,7 @@ async def lifespan(app: FastAPI):
         # to generate the nudge text, so it must exist before the job is added.
         agent = await stack.enter_async_context(build_agent(checkpointer=checkpointer))
         app.state.agent = agent
-        scheduler = start_reminder_scheduler(agent)
+        scheduler = start_reminder_scheduler(agent, evening_view=_telegram_evening_view)
 
         # Telegram: build the Application, drive it in-process. Updates arrive
         # at POST /webhook/telegram, which calls telegram_app.process_update().
@@ -746,6 +746,14 @@ async def _telegram_today_view() -> TodayView:
     session = get_session()
     try:
         return _today_view(session, _telegram_user_id(), today)
+    finally:
+        session.close()
+
+
+async def _telegram_evening_view(day: date) -> TodayView:
+    session = get_session()
+    try:
+        return _today_view(session, _telegram_user_id(), day)
     finally:
         session.close()
 
