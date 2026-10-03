@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from collections.abc import Awaitable, Callable
 from typing import NamedTuple
 
@@ -140,22 +141,41 @@ async def _handle_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await query.answer("Not authorized.", show_alert=True)
         return
     on_toggle: OnToggle = context.application.bot_data["on_toggle"]
+    started = time.perf_counter()
+    # Acknowledge first: Telegram shows a spinner on the button until the
+    # query is answered, so do it before the database work, not after.
+    await query.answer()
+    answered = time.perf_counter()
     try:
         view = await on_toggle(int(query.data.split(":", 1)[1]))
-    except Exception:  # generic alert only; the real error stays in the logs
+        if view is None:
+            # Missing / not this user's habit (a stale or forged button). The
+            # query is already answered, so re-render the user's real view
+            # instead of alerting; nothing was written.
+            logger.warning("Telegram tap on an unknown or foreign habit; refreshing the view.")
+            view = await context.application.bot_data["on_today"]()
+    except Exception:  # generic message only; the real error stays in the logs
         logger.exception("Failed to toggle a habit from a Telegram tap.")
-        await query.answer("Something went wrong. Please try again.", show_alert=True)
+        if update.effective_chat is not None:
+            await context.bot.send_message(
+                update.effective_chat.id, "⚠️ Something went wrong. Please try again."
+            )
         return
-    if view is None:
-        await query.answer("Habit not found.", show_alert=True)
-        return
-    await query.answer()
+    worked = time.perf_counter()
     text, markup = render_today(view)
     try:
         await query.edit_message_text(text, reply_markup=markup)
     except BadRequest as exc:
         if "message is not modified" not in str(exc).lower():
             raise
+    finished = time.perf_counter()
+    logger.info(
+        "Telegram tap timing: answer=%.0fms db=%.0fms edit=%.0fms total=%.0fms",
+        (answered - started) * 1000,
+        (worked - answered) * 1000,
+        (finished - worked) * 1000,
+        (finished - started) * 1000,
+    )
 
 
 def build_application(

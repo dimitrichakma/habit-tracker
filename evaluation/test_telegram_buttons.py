@@ -297,8 +297,11 @@ async def test_forged_callback_for_another_users_habit_is_refused(owner):
     await bot._handle_toggle(update, _context())
 
     assert _logs(foreign_habit) == []
-    query.edit_message_text.assert_not_awaited()
-    assert query.answer.await_args.kwargs.get("show_alert") is True
+    # answered up front (no alert); the message is refreshed to the user's OWN view
+    query.answer.assert_awaited_once_with()
+    text = query.edit_message_text.await_args.args[0]
+    assert "Secret" not in str(query.edit_message_text.await_args)
+    assert text.startswith("Today")
 
 
 @pytest.mark.parametrize("data", ["tog:abc", "tog:1;drop", "tog:", "x", "tog:-1", "tog:1:2"])
@@ -400,3 +403,20 @@ def test_callback_query_webhook_is_rate_limited_per_chat(webhook_client, monkeyp
 
 def test_callback_query_webhook_requires_secret(webhook_client):
     assert webhook_client.post("/webhook/telegram", json=_BODY).status_code == 401
+
+
+async def test_tap_uses_few_queries_and_answers_before_db_work(owner):
+    from sqlalchemy import event
+
+    _, habit_id = owner
+    await main._telegram_today_view()  # warm the cached user-id lookup
+    order, statements = [], []
+    event.listen(database.engine, "before_cursor_execute", lambda *a: statements.append(a[2]))
+    update, query = _tap_update(habit_id)
+    query.answer.side_effect = lambda *a, **k: order.append(len(statements))
+
+    await bot._handle_toggle(update, _context())
+
+    assert order == [0]  # answered before any SQL ran
+    selects = [s for s in statements if s.lstrip().upper().startswith(("SELECT", "INSERT", "DELETE", "UPDATE"))]
+    assert len(selects) <= 6, selects

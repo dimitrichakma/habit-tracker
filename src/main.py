@@ -37,6 +37,7 @@ from .auth import (
     require_signup_allowed,
     verify_password,
 )
+from . import database
 from .database import (
     Habit,
     User,
@@ -714,21 +715,32 @@ async def log_habit_direct(
 # Identity is the fixed HABIT_TRACKER_USERNAME account, resolved server-side.
 
 
+_telegram_user_id_cache: tuple[object, str, int] | None = None
+
+
 def _telegram_user_id() -> int:
+    """The HABIT_TRACKER_USERNAME account's id, looked up once and cached (it
+    never changes for the process). Keyed on the current SessionLocal too, so a
+    test swapping in a throwaway database doesn't see a stale id."""
+    global _telegram_user_id_cache
     username = os.environ["HABIT_TRACKER_USERNAME"]
+    cached = _telegram_user_id_cache
+    if cached is not None and cached[0] is database.SessionLocal and cached[1] == username:
+        return cached[2]
     user_id = find_user_id_by_username(username)
     if user_id is None:
         raise RuntimeError(f"No account for HABIT_TRACKER_USERNAME={username!r}")
+    _telegram_user_id_cache = (database.SessionLocal, username, user_id)
     return user_id
 
 
-def _today_view(session, user_id: int, today: date) -> TodayView:
+def _today_view(session, user_id: int, today: date, habits: list[Habit] | None = None) -> TodayView:
     """Same habits as GET /habits/today (due today only). `state` is what a tap
     will do: "done" = today's own log is done (tap removes it); "earlier" =
     satisfied only by an earlier day in the rolling window (tap logs today);
     "pending" = not satisfied (tap logs today)."""
     items: list[TodayItem] = []
-    for habit in get_user_habits(session, user_id):
+    for habit in habits if habits is not None else get_user_habits(session, user_id):
         if not is_due_today(habit, today):
             continue
         if any(entry.date == today and entry.status == "done" for entry in habit.logs):
@@ -760,20 +772,24 @@ async def _telegram_evening_view(day: date) -> TodayView:
 
 async def _telegram_toggle(habit_id: int) -> TodayView | None:
     """Toggle one habit's log for today, then return the freshly rendered view
-    (None if the habit doesn't exist or isn't this user's)."""
+    (None if the habit doesn't exist or isn't this user's). Loads the user's
+    habits once, builds the view from them after the write (re-reading only the
+    toggled habit's logs) and commits last: ~4 queries, not a full re-read."""
     today = date.today()
     session = get_session()
     try:
         user_id = _telegram_user_id()
-        habit = session.get(Habit, habit_id)
-        if habit is None or habit.user_id != user_id:
+        habits = get_user_habits(session, user_id)
+        habit = next((h for h in habits if h.id == habit_id), None)
+        if habit is None:
             return None
         done_today = any(entry.date == today and entry.status == "done" for entry in habit.logs)
-        if set_habit_done(session, user_id, habit_id, today, not done_today) is None:
-            return None
+        set_habit_done(session, user_id, habit_id, today, not done_today)
+        session.flush()
+        session.refresh(habit, ["logs"])
+        view = _today_view(session, user_id, today, habits)
         session.commit()
-        session.expire_all()  # re-read logs so the view reflects the write
-        return _today_view(session, user_id, today)
+        return view
     finally:
         session.close()
 
