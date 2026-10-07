@@ -69,3 +69,47 @@ def test_youtube_with_no_title_is_entertainment():
 def test_shipped_app_names_resolve():
     assert match("Xcode", None, None) == "Work"
     assert match("Slack", None, None) == "Communication"
+
+
+# --- Part B: the YouTube rule must not depend on category order ---
+
+import itertools
+
+import pytest
+
+from desktop_tracker.categorize import rules as rules_module
+
+
+def test_tutorial_beats_youtube_site_even_when_the_title_names_youtube():
+    # Real tab titles end in "- YouTube", which is itself an Entertainment keyword.
+    assert match("Google Chrome", "www.youtube.com", "Python tutorial - YouTube") == "Learning"
+
+
+def test_youtube_rule_holds_for_every_category_order(monkeypatch):
+    for order in itertools.permutations(rules_module.CATEGORIES):
+        monkeypatch.setattr(rules_module, "CATEGORIES", order)
+        got = match("Google Chrome", "www.youtube.com", "Python tutorial - YouTube")
+        assert got == "Learning", order
+        got = match("Google Chrome", "www.youtube.com", "Funny cats - YouTube")
+        assert got == "Entertainment", order
+
+
+def test_youtube_rule_holds_when_the_rules_dict_lists_entertainment_first():
+    reordered = {
+        "Entertainment": {"apps": [], "keywords": ["youtube"]},
+        "Learning": {"apps": [], "keywords": ["tutorial"]},
+    }
+    assert match("Chrome", "www.youtube.com", "A tutorial - YouTube", rules=reordered) == "Learning"
+
+
+def test_title_keyword_that_is_just_the_site_name_adds_nothing():
+    assert match("Chrome", "www.youtube.com", "Funny cats - YouTube") == "Entertainment"
+
+
+def test_without_a_site_a_youtube_title_still_counts():
+    assert match("Some App", None, "Cats - YouTube") == "Entertainment"
+
+
+def test_browsers_resolve_to_other_by_rules():
+    for name in ("Google Chrome", "Safari", "Firefox", "Arc", "Brave Browser", "Microsoft Edge"):
+        assert match(name, None, None) == "Other", name

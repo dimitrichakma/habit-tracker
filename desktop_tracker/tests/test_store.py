@@ -112,3 +112,72 @@ def test_default_path_resolves_to_config_db_path(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "DB_PATH", target)
     ActivityStore().close()
     assert target.exists()
+
+
+# --- Part B: site column + category cache ---
+
+
+def test_site_round_trips_and_none_stays_null(tmp_path):
+    path = tmp_path / "a.db"
+    store = ActivityStore(path)
+    with_site = Sample(ts=1, app="Google Chrome", window_title="T", idle_seconds=0.0, site="example.com")
+    store.add(with_site)
+    store.add(fake(ts=2))
+    assert store.rows()[0] == with_site
+    assert store.rows()[1].site is None
+    store.close()
+    assert sqlite3.connect(path).execute("SELECT site FROM samples ORDER BY ts").fetchall() == [
+        ("example.com",), (None,),
+    ]
+
+
+OLD_SCHEMA = """
+CREATE TABLE samples (
+    id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, app TEXT NOT NULL,
+    window_title TEXT, idle_seconds REAL NOT NULL
+);
+CREATE INDEX idx_samples_ts ON samples(ts);
+"""
+
+
+def test_old_database_is_migrated_without_losing_rows(tmp_path):
+    path = tmp_path / "old.db"
+    old = sqlite3.connect(path)
+    old.executescript(OLD_SCHEMA)
+    old.execute("INSERT INTO samples (ts, app, window_title, idle_seconds) VALUES (10, 'Xcode', 'a', 0.5)")
+    old.execute("INSERT INTO samples (ts, app, window_title, idle_seconds) VALUES (15, 'Slack', NULL, 1.0)")
+    old.commit()
+    old.close()
+
+    store = ActivityStore(path)
+    assert [(r.ts, r.app, r.window_title, r.idle_seconds, r.site) for r in store.rows()] == [
+        (10, "Xcode", "a", 0.5, None), (15, "Slack", None, 1.0, None),
+    ]
+    store.add(Sample(ts=20, app="Safari", window_title="x", idle_seconds=0.0, site="a.com"))
+    store.close()
+
+    again = ActivityStore(path)  # second open: migration is a no-op
+    assert len(again.rows()) == 3
+    again.close()
+
+
+def test_category_cache_get_set_overwrite_and_persist(tmp_path):
+    path = tmp_path / "a.db"
+    store = ActivityStore(path)
+    assert store.get_category("app", "zed") is None
+    store.set_category("app", "zed", "Work")
+    store.set_category("app", "zed", "Learning")
+    assert store.get_category("app", "zed") == "Learning"
+    store.close()
+    again = ActivityStore(path)
+    assert again.get_category("app", "zed") == "Learning"
+    again.close()
+
+
+def test_category_cache_kinds_do_not_collide(tmp_path):
+    store = ActivityStore(tmp_path / "a.db")
+    store.set_category("app", "reddit", "Other")
+    store.set_category("site", "reddit", "Social")
+    assert store.get_category("app", "reddit") == "Other"
+    assert store.get_category("site", "reddit") == "Social"
+    store.close()

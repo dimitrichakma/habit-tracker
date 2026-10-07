@@ -83,8 +83,9 @@ Commands run from `desktop_tracker/`: `uv sync`, `uv run pytest`,
 Part 3 is built in two steps:
 - **Part A (done):** sessions, `categories.yaml`, rule matching (title keyword > site
   keyword > app name, keywords >= 4 chars), `python -m desktop_tracker today`, unknown -> Other.
-- **Part B (not started):** Chrome/Safari tab titles (skip private windows), `site` column
-  (URL host only), Ollama fallback + category cache.
+- **Part B (done, Safari pending):** Chrome tab title + host via AppleScript (incognito skipped), `site`
+  column (URL host only, old DBs migrated), `category_cache`, local-Ollama fallback at report time.
+  Safari is app-name only until `spikes/safari_private.py` shows private windows are detectable.
 
 Decisions: sessions only bridge sampling gaps under 30s (a switch to another app always
 splits). There is no `sessions` table; sessions are computed from `samples` on demand.

@@ -124,6 +124,7 @@ def test_today_subcommand_prints_the_report(tmp_path, monkeypatch, capsys):
         sample(at(DAY, 9), "Xcode"),
         sample(at(DAY, 9, 0, 5), "Xcode"),
     ]).close()
+    monkeypatch.setattr(cli, "OllamaClassifier", lambda: None)  # never reach a real Ollama
 
     cli.main(["today"])
 
@@ -141,3 +142,63 @@ def test_no_subcommand_still_starts_tracking(tmp_path, monkeypatch):
     cli.main([])
 
     assert calls == ["fake-sampler"]
+
+
+# --- Part B: unknown apps/sites are classified at report time ---
+
+
+class FakeClassifier:
+    def __init__(self, answers=None, raises=None):
+        self.answers, self.raises, self.calls = answers or {}, raises, []
+
+    def classify(self, name, kind):
+        self.calls.append((kind, name))
+        if self.raises:
+            raise self.raises
+        return self.answers.get(name)
+
+
+def test_unknown_app_uses_the_classifier_and_the_cache(tmp_path):
+    store = make_store(tmp_path, [sample(at(DAY, 9), "Zed"), sample(at(DAY, 9, 0, 5), "Zed")])
+    clf = FakeClassifier({"Zed": "Work"})
+    assert report.time_per_category(store, DAY, classifier=clf)["Work"] == 10
+    assert clf.calls == [("app", "Zed")]
+    report.time_per_category(store, DAY, classifier=clf)
+    assert len(clf.calls) == 1  # cached: never asked again
+
+
+def test_site_is_used_for_browser_samples(tmp_path):
+    store = make_store(tmp_path, [
+        Sample(ts=at(DAY, 9), app="Google Chrome", window_title="Secret", idle_seconds=0.0, site="learn.example.org"),
+    ])
+    clf = FakeClassifier({"learn.example.org": "Learning"})
+    assert report.time_per_category(store, DAY, classifier=clf)["Learning"] == 5
+    assert clf.calls == [("site", "learn.example.org")]
+
+
+def test_ollama_down_gives_other_without_caching(tmp_path):
+    store = make_store(tmp_path, [sample(at(DAY, 9), "Zed"), sample(at(DAY, 9, 0, 5), "Quux")])
+    clf = FakeClassifier(raises=ConnectionError("off"))
+    lines = []
+    totals = report.time_per_category(store, DAY, classifier=clf, out=lines.append)
+    assert totals["Other"] == 10
+    assert len(clf.calls) == 1  # skipped for the rest of the report
+    assert store.get_category("app", "zed") is None
+    assert len(lines) == 1
+
+
+def test_no_classifier_keeps_part_a_behaviour(tmp_path):
+    store = make_store(tmp_path, [sample(at(DAY, 9), "Zed")])
+    assert report.time_per_category(store, DAY)["Other"] == 5
+
+
+def test_today_command_builds_a_local_classifier(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(config, "DB_PATH", tmp_path / "a.db")
+    monkeypatch.setattr(report, "today", lambda: DAY)
+    make_store(tmp_path, [sample(at(DAY, 9), "Zed")]).close()
+    clf = FakeClassifier({"Zed": "Work"})
+    monkeypatch.setattr(cli, "OllamaClassifier", lambda: clf)
+
+    cli.main(["today"])
+
+    assert "Work" in capsys.readouterr().out

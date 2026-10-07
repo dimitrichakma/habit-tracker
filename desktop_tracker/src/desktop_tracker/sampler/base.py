@@ -17,8 +17,9 @@ ACCESSIBILITY_MESSAGE = (
 class Sample:
     ts: int  # UTC unix epoch, whole seconds
     app: str
-    window_title: str | None  # None = could not be read
+    window_title: str | None  # None = could not be read; the tab title for browsers
     idle_seconds: float
+    site: str | None = None  # URL host only (never the full URL); browsers only
     issue: str | None = None  # runtime-only note (e.g. missing permission); never stored
 
 

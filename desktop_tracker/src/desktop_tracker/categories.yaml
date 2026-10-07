@@ -19,5 +19,7 @@ Entertainment:
   apps: [Music, Spotify, TV, Netflix, VLC, Steam, QuickTime Player]
   keywords: [youtube, netflix, twitch, hulu, disneyplus, spotify]
 Other:
-  apps: []
+  # Browsers: their category comes from the site/title; the bare app (e.g. a private
+  # window, where nothing is stored) stays Other instead of being sent to Ollama.
+  apps: [Google Chrome, Safari, Firefox, Arc, Brave Browser, Microsoft Edge]
   keywords: []

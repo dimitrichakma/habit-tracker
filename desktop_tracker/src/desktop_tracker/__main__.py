@@ -1,6 +1,7 @@
 import argparse
 
 from . import config, report, tracker
+from .categorize.ollama_classifier import OllamaClassifier
 from .sampler.macos import MacSampler
 from .store import ActivityStore
 
@@ -19,7 +20,7 @@ def _track() -> None:
 def _today() -> None:
     store = ActivityStore()
     try:
-        report.run_today(store)
+        report.run_today(store, classifier=OllamaClassifier())
     finally:
         store.close()
 

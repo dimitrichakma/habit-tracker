@@ -243,3 +243,14 @@ def test_permission_message_is_clear_and_actionable():
     assert "Accessibility" in ACCESSIBILITY_MESSAGE
     assert "System Settings" in ACCESSIBILITY_MESSAGE
     assert "Privacy & Security" in ACCESSIBILITY_MESSAGE
+
+
+def test_browser_automation_message_is_printed_once_per_run(tmp_path):
+    store = ActivityStore(tmp_path / "a.db")
+    msg = "Browser tabs are unavailable: Automation permission for Google Chrome is not granted."
+    sampler = ScriptedSampler([s(10, issue=msg), s(15, issue=msg), s(20, issue=msg)])
+
+    _, lines = run(sampler, store, 3)
+
+    assert sum(msg in line for line in lines) == 1
+    store.close()

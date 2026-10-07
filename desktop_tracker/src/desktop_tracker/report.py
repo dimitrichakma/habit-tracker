@@ -3,7 +3,8 @@
 from datetime import date, datetime, time, timedelta
 
 from . import config
-from .categorize import CATEGORIES, categorize
+from .categorize import CATEGORIES
+from .categorize.resolver import CategoryResolver
 from .sampler.base import is_idle
 from .store import ActivityStore
 
@@ -20,12 +21,18 @@ def _day_bounds(day: date) -> tuple[int, int]:
 
 
 def time_per_category(
-    store: ActivityStore, day: date, interval: int = config.SAMPLE_INTERVAL_SECONDS
+    store: ActivityStore,
+    day: date,
+    interval: int = config.SAMPLE_INTERVAL_SECONDS,
+    classifier=None,
+    out=print,
 ) -> dict[str, int]:
+    """Unknown apps/sites are resolved here (cache, then `classifier`), never while tracking."""
     totals = dict.fromkeys(CATEGORIES, 0)
+    resolver = CategoryResolver(store, classifier, out=out)
     for sample in store.between(*_day_bounds(day)):
         if not is_idle(sample):
-            totals[categorize(sample.app, sample.window_title)] += interval
+            totals[resolver.resolve(sample.app, sample.site, sample.window_title)] += interval
     return totals
 
 
@@ -46,5 +53,5 @@ def format_report(totals: dict[str, int]) -> str:
     return "\n".join(lines)
 
 
-def run_today(store: ActivityStore, out=print) -> None:
-    out(format_report(time_per_category(store, today())))
+def run_today(store: ActivityStore, out=print, classifier=None) -> None:
+    out(format_report(time_per_category(store, today(), classifier=classifier, out=out)))

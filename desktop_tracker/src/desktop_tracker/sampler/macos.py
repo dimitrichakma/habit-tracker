@@ -21,6 +21,7 @@ from Quartz import (
 )
 
 from .base import ACCESSIBILITY_MESSAGE, Sample
+from .browser import read_tab
 
 _AX_API_DISABLED = -25211  # kAXErrorAPIDisabled: Accessibility not allowed
 
@@ -75,10 +76,24 @@ class MacSampler:
             except Exception as exc:
                 issue = issue or f"Could not read the window title: {exc}"
 
+        site = None
+        try:
+            tab = read_tab(app)
+            if tab is not None:
+                issue = issue or tab.issue
+                if tab.private:
+                    title = None  # private window: store nothing, not even the AX title
+                elif tab.title is not None:
+                    title, site = tab.title, tab.site
+        except Exception as exc:
+            issue = issue or f"Could not read the browser tab: {exc}"
+
         try:
             idle = _idle_seconds()
         except Exception as exc:
             idle = 0.0
             issue = issue or f"Could not read idle time: {exc}"
 
-        return Sample(ts=ts, app=app, window_title=title, idle_seconds=idle, issue=issue)
+        return Sample(
+            ts=ts, app=app, window_title=title, idle_seconds=idle, site=site, issue=issue
+        )
