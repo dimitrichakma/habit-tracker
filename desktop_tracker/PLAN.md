@@ -80,6 +80,16 @@ Commands run from `desktop_tracker/`: `uv sync`, `uv run pytest`,
 - Command that prints today's time per category.
 - Claude Code hook runs desktop_tracker tests after edits there.
 
+Part 3 is built in two steps:
+- **Part A (done):** sessions, `categories.yaml`, rule matching (title keyword > site
+  keyword > app name, keywords >= 4 chars), `python -m desktop_tracker today`, unknown -> Other.
+- **Part B (not started):** Chrome/Safari tab titles (skip private windows), `site` column
+  (URL host only), Ollama fallback + category cache.
+
+Decisions: sessions only bridge sampling gaps under 30s (a switch to another app always
+splits). There is no `sessions` table; sessions are computed from `samples` on demand.
+Time per category is the sum of non-idle samples.
+
 ## Part 4: Menu bar, habits, and alerts
 - rumps menu bar app, icon shows focused, distracted, idle, or paused.
 - Menu: today's totals, pause tracking, snooze alerts, quit.
