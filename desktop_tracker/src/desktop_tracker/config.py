@@ -4,3 +4,6 @@ from pathlib import Path
 
 DATA_DIR = Path.home() / "Library" / "Application Support" / "FocusTracker"
 DB_PATH = DATA_DIR / "activity.db"
+
+SAMPLE_INTERVAL_SECONDS = 5
+IDLE_THRESHOLD_SECONDS = 120

@@ -60,6 +60,10 @@ Commands run from `desktop_tracker/`: `uv sync`, `uv run pytest`,
 - Rate limits / JWT expiry: send on state change, re-login on 401, queue offline.
 - Window titles need Accessibility / Screen Recording permission: degrade, never crash.
 
+## Known limits
+- If reading idle time fails, `idle_seconds` is stored as 0.0 (looks like active use) and an issue is reported.
+- A failed tick (sampler or DB write error) saves no row, so it leaves a gap in the data.
+
 ---
 
 ## Part 3: Tracker and categories
