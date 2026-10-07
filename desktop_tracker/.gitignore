@@ -1,0 +1,19 @@
+# Local activity data must never be committed. The real DB lives outside the
+# repo (~/Library/Application Support/FocusTracker/); these are a backstop in
+# case a copy, export or test artefact lands in here.
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.sqlite-journal
+FocusTracker/
+Application Support/
+Library/
+activity*.csv
+activity*.json
+.env
+.venv/
+__pycache__/
+.pytest_cache/

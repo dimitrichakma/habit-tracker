@@ -1,0 +1,30 @@
+[project]
+name = "desktop-tracker"
+version = "0.1.0"
+description = "Local macOS activity tracker (menu bar app). Separate from the habit_tracker backend."
+requires-python = ">=3.13"
+dependencies = [
+    "httpx>=0.28.1",
+    "keyring>=25.0.0",
+    "ollama>=0.4.0",
+    "pydantic>=2.13.4",
+    "pyobjc-framework-ApplicationServices>=10.3",
+    "pyobjc-framework-Quartz>=10.3",
+    "pyyaml>=6.0",
+    "rumps>=0.4.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/desktop_tracker"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
