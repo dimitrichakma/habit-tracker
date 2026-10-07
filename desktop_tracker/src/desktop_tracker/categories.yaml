@@ -1,0 +1,25 @@
+# Maps apps and keywords to a category. Edit freely.
+# apps:     exact app name, case-insensitive.
+# keywords: substring of the tab title or site, case-insensitive, at least 4 characters.
+# Precedence: title keyword > site keyword > app name. Ties go by category order below.
+# Anything unmatched is Other.
+Work:
+  apps: [Xcode, Terminal, iTerm2, Visual Studio Code, Code, Cursor, PyCharm, Figma, Numbers, Pages, Keynote, Microsoft Word, Microsoft Excel, Microsoft PowerPoint, Notion]
+  keywords: [github, gitlab, stackoverflow, jira, notion.so, docs.google, figma.com]
+Learning:
+  apps: [Anki, Books, Kindle]
+  keywords: [tutorial, course, lecture, coursera, udemy, khanacademy, leetcode, freecodecamp, wikipedia]
+Communication:
+  apps: [Slack, Mail, Messages, Zoom, zoom.us, Microsoft Teams, WhatsApp, Telegram, FaceTime]
+  keywords: [mail.google, outlook, slack.com, meet.google]
+Social:
+  apps: [Discord]
+  keywords: [twitter, facebook, instagram, reddit, linkedin, tiktok, snapchat]
+Entertainment:
+  apps: [Music, Spotify, TV, Netflix, VLC, Steam, QuickTime Player]
+  keywords: [youtube, netflix, twitch, hulu, disneyplus, spotify]
+Other:
+  # Browsers: their category comes from the site/title; the bare app (e.g. a private
+  # window, where nothing is stored) stays Other instead of being sent to Ollama.
+  apps: [Google Chrome, Safari, Firefox, Arc, Brave Browser, Microsoft Edge]
+  keywords: []

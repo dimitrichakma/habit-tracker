@@ -102,6 +102,12 @@
   message. No LLM, no HTTP to our own API — `bot.py` gets two callbacks from
   `main.py`, which call `database.set_habit_done` in-process (the same function
   `POST /habits/{id}/log` uses). Chat logging is unchanged.
+- desktop_tracker/ — local macOS activity tracker (menu bar app). Separate
+  module: own pyproject/uv.lock/.venv, own tests; NOT in the Docker image,
+  Streamlit app, or root test suites. Only calls POST /auth/login, GET
+  /habits/today and POST /habits/{id}/log. Raw activity data stays local
+  (DB under ~/Library/Application Support/FocusTracker/). See
+  desktop_tracker/CLAUDE.md and desktop_tracker/PLAN.md.
 
 # Tech Stack
 - Backend: FastAPI, LangGraph, LangChain (Anthropic), SQLAlchemy,
